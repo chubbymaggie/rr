@@ -3,11 +3,13 @@
 #ifndef RR_FD_TABLE_H_
 #define RR_FD_TABLE_H_
 
-#include <unordered_map>
 #include <memory>
+#include <unordered_map>
 
-#include "AddressSpace.h"
 #include "FileMonitor.h"
+#include "HasTaskSet.h"
+
+namespace rr {
 
 class TraceTaskEvent;
 
@@ -16,11 +18,16 @@ public:
   typedef std::shared_ptr<FdTable> shr_ptr;
 
   void add_monitor(int fd, FileMonitor* monitor);
-  bool allow_close(int fd);
+  bool emulate_ioctl(int fd, RecordTask* t, uint64_t* result);
+  bool emulate_fcntl(int fd, RecordTask* t, uint64_t* result);
+  bool emulate_read(int fd, RecordTask* t,
+                    const std::vector<FileMonitor::Range>& ranges,
+                    FileMonitor::LazyOffset& offset, uint64_t* result);
+  void filter_getdents(int fd, RecordTask* t);
+  bool is_rr_fd(int fd);
   Switchable will_write(Task* t, int fd);
-  void did_write(Task* t, int fd,
-                 const std::vector<FileMonitor::Range>& ranges);
-
+  void did_write(Task* t, int fd, const std::vector<FileMonitor::Range>& ranges,
+                 FileMonitor::LazyOffset& offset);
   void did_dup(int from, int to);
   void did_close(int fd);
 
@@ -36,6 +43,8 @@ public:
   }
 
   bool is_monitoring(int fd) { return fds.count(fd) > 0; }
+
+  FileMonitor* get_monitor(int fd);
 
   /**
    * Regenerate syscallbuf_fds_disabled in task |t|.
@@ -60,5 +69,7 @@ private:
 
   std::unordered_map<int, FileMonitor::shr_ptr> fds;
 };
+
+} // namespace rr
 
 #endif /* RR_FD_TABLE_H_ */

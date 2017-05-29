@@ -1,7 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "GdbConnection"
-
 #define REVERSE_EXECUTION
 
 /**
@@ -12,13 +10,12 @@
 
 #include "GdbConnection.h"
 
-#include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
-#include <netinet/in.h>
 #include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -28,23 +25,20 @@
 #include <sstream>
 #include <vector>
 
-#include "log.h"
 #include "GdbCommandHandler.h"
 #include "ReplaySession.h"
 #include "ScopedFd.h"
-#include "StringVectorToCharArray.h"
+#include "log.h"
+
+using namespace std;
+
+namespace rr {
 
 static const char INTERRUPT_CHAR = '\x03';
 
-#ifdef DEBUGTAG
-#define UNHANDLED_REQ() FATAL()
-#else
 #define UNHANDLED_REQ()                                                        \
   write_packet("");                                                            \
   LOG(info)
-#endif
-
-using namespace std;
 
 const GdbThreadId GdbThreadId::ANY(0, 0);
 const GdbThreadId GdbThreadId::ALL(-1, -1);
@@ -60,171 +54,20 @@ static bool request_needs_immediate_response(const GdbRequest* req) {
 }
 
 GdbConnection::GdbConnection(pid_t tgid, const Features& features)
-    : tgid(tgid), no_ack(false), inlen(0), outlen(0), features_(features) {
+    : tgid(tgid),
+      cpu_features_(0),
+      no_ack(false),
+      features_(features),
+      connection_alive_(true) {
 #ifndef REVERSE_EXECUTION
   features_.reverse_execution = false;
 #endif
 }
 
-static ScopedFd open_socket(const char* address, unsigned short* port,
-                            GdbConnection::ProbePort probe) {
-  ScopedFd listen_fd(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
-  if (!listen_fd.is_open()) {
-    FATAL() << "Couldn't create socket";
-  }
-
-  struct sockaddr_in addr;
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = inet_addr(address);
-  int reuseaddr = 1;
-  int ret = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuseaddr,
-                       sizeof(reuseaddr));
-  if (ret < 0) {
-    FATAL() << "Couldn't set SO_REUSEADDR";
-  }
-
-  do {
-    addr.sin_port = htons(*port);
-    ret = ::bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr));
-    if (ret && (EADDRINUSE == errno || EACCES == errno || EINVAL == errno)) {
-      continue;
-    }
-    if (ret) {
-      FATAL() << "Couldn't bind to port " << *port;
-    }
-
-    ret = listen(listen_fd, 1 /*backlogged connection*/);
-    if (ret && EADDRINUSE == errno) {
-      continue;
-    }
-    if (ret) {
-      FATAL() << "Couldn't listen on port " << *port;
-    }
-    break;
-  } while (++(*port), probe == GdbConnection::PROBE_PORT);
-  return listen_fd;
-}
-
 void GdbConnection::await_debugger(ScopedFd& listen_fd) {
-  struct sockaddr_in client_addr;
-  socklen_t len = sizeof(client_addr);
-
-  sock_fd = ScopedFd(accept(listen_fd, (struct sockaddr*)&client_addr, &len));
+  sock_fd = ScopedFd(accept(listen_fd, nullptr, nullptr));
   // We might restart this debugging session, so don't set the
   // socket fd CLOEXEC.
-}
-
-static const char connection_addr[] = "127.0.0.1";
-
-struct DebuggerParams {
-  char exe_image[PATH_MAX];
-  short port;
-};
-
-unique_ptr<GdbConnection> GdbConnection::await_client_connection(
-    unsigned short desired_port, ProbePort probe, pid_t tgid,
-    const string& exe_image, const Features& features,
-    ScopedFd* client_params_fd) {
-  auto dbg = unique_ptr<GdbConnection>(new GdbConnection(tgid, features));
-  unsigned short port = desired_port;
-  ScopedFd listen_fd = open_socket(connection_addr, &port, probe);
-  if (client_params_fd) {
-    DebuggerParams params;
-    memset(&params, 0, sizeof(params));
-    strncpy(params.exe_image, exe_image.c_str(), sizeof(params.exe_image) - 1);
-    params.port = port;
-
-    ssize_t nwritten = write(*client_params_fd, &params, sizeof(params));
-    assert(nwritten == sizeof(params));
-  } else {
-    fprintf(stderr, "Launch gdb with\n"
-                    "  gdb %s\n"
-                    "and attach to the rr debug server with:\n"
-                    "  target remote :%d\n",
-            exe_image.c_str(), port);
-  }
-  LOG(debug) << "limiting debugger traffic to tgid " << tgid;
-  dbg->await_debugger(listen_fd);
-  return dbg;
-}
-
-static string create_gdb_command_file(const string& macros) {
-  char tmp[] = "/tmp/rr-gdb-commands-XXXXXX";
-  // This fd is just leaked. That's fine since we only call this once
-  // per rr invocation at the moment.
-  int fd = mkstemp(tmp);
-  unlink(tmp);
-
-  ssize_t len = macros.size();
-  int written = write(fd, macros.c_str(), len);
-  if (written != len) {
-    FATAL() << "Failed to write gdb command file";
-  }
-
-  stringstream procfile;
-  procfile << "/proc/" << getpid() << "/fd/" << fd;
-  return procfile.str();
-}
-
-void GdbConnection::launch_gdb(ScopedFd& params_pipe_fd, const string& macros,
-                               const string& gdb_command_file_path,
-                               const string& gdb_binary_file_path) {
-  DebuggerParams params;
-  ssize_t nread;
-  while (true) {
-    nread = read(params_pipe_fd, &params, sizeof(params));
-    if (nread == 0) {
-      // pipe was closed. Probably rr failed/died.
-      return;
-    }
-    if (nread != -1 || errno != EINTR) {
-      break;
-    }
-  }
-  assert(nread == sizeof(params));
-
-  stringstream attach_cmd;
-  attach_cmd << "target extended-remote " << connection_addr << ":"
-             << params.port;
-  LOG(debug) << "launching " << gdb_binary_file_path << " with command '"
-             << attach_cmd.str() << "'";
-
-  vector<string> args;
-  args.push_back(gdb_binary_file_path);
-  // The gdb protocol uses the "vRun" packet to reload
-  // remote targets.  The packet is specified to be like
-  // "vCont", in which gdb waits infinitely long for a
-  // stop reply packet.  But in practice, gdb client
-  // expects the vRun to complete within the remote-reply
-  // timeout, after which it issues vCont.  The timeout
-  // causes gdb<-->rr communication to go haywire.
-  //
-  // rr can take a very long time indeed to send the
-  // stop-reply to gdb after restarting replay; the time
-  // to reach a specified execution target is
-  // theoretically unbounded.  Timing out on vRun is
-  // technically a gdb bug, but because the rr replay and
-  // the gdb reload models don't quite match up, we'll
-  // work around it on the rr side by disabling the
-  // remote-reply timeout.
-  args.push_back("-l");
-  args.push_back("-1");
-  args.push_back(params.exe_image);
-  if (gdb_command_file_path.length() > 0) {
-    args.push_back("-x");
-    args.push_back(gdb_command_file_path);
-  }
-  if (macros.size()) {
-    string gdb_command_file = create_gdb_command_file(macros);
-    args.push_back("-x");
-    args.push_back(gdb_command_file);
-  }
-  args.push_back("-ex");
-  args.push_back(attach_cmd.str());
-
-  StringVectorToCharArray c_args(args);
-  execvp(gdb_binary_file_path.c_str(), c_args.get());
-  FATAL() << "Failed to exec gdb.";
 }
 
 /**
@@ -239,7 +82,7 @@ static bool poll_socket(const ScopedFd& sock_fd, short events, int timeoutMs) {
 
   int ret = poll(&pfd, 1, timeoutMs);
   if (ret < 0 && errno != EINTR) {
-    FATAL() << "Polling gdb socket failed";
+    LOG(info) << "gdb socket has been closed";
   }
   return ret > 0;
 }
@@ -260,45 +103,45 @@ void GdbConnection::read_data_once() {
   /* Wait until there's data, instead of busy-looping on
    * EAGAIN. */
   poll_incoming(sock_fd, -1 /* wait forever */);
-  nread = read(sock_fd, inbuf + inlen, sizeof(inbuf) - inlen);
-  if (0 == nread) {
-    LOG(info) << "(gdb closed debugging socket, exiting)";
-    exit(0);
-  }
+  uint8_t buf[4096];
+  nread = read(sock_fd, buf, sizeof(buf));
   if (nread <= 0) {
-    FATAL() << "Error reading from gdb";
+    LOG(info) << "Could not read data from gdb socket, "
+                 "marking connection as closed";
+    connection_alive_ = false;
+  } else {
+    inbuf.insert(inbuf.end(), buf, buf + nread);
   }
-  inlen += nread;
-  assert("Impl dynamic alloc if this fails (or double inbuf size)" &&
-         inlen < int(sizeof(inbuf)));
 }
 
 void GdbConnection::write_flush() {
-  ssize_t write_index = 0;
+  size_t write_index = 0;
 
-#ifdef DEBUGTAG
-  outbuf[outlen] = '\0';
-  LOG(debug) << "write_flush: '" << outbuf << "'";
-#endif
-  while (write_index < outlen) {
+  outbuf.push_back(0);
+  LOG(debug) << "write_flush: '" << outbuf.data() << "'";
+  outbuf.pop_back();
+
+  while (write_index < outbuf.size()) {
     ssize_t nwritten;
 
     poll_outgoing(sock_fd, -1 /*wait forever*/);
-    nwritten = write(sock_fd, outbuf + write_index, outlen - write_index);
+    nwritten = write(sock_fd, outbuf.data() + write_index,
+                     outbuf.size() - write_index);
     if (nwritten < 0) {
-      FATAL() << "Error writing to gdb";
+      LOG(info) << "Could not write data to gdb socket, "
+                   "marking connection as closed";
+      connection_alive_ = false;
+      outbuf.clear();
+      return;
+    } else {
+      write_index += nwritten;
     }
-    write_index += nwritten;
   }
-  outlen = 0;
+  outbuf.clear();
 }
 
 void GdbConnection::write_data_raw(const uint8_t* data, ssize_t len) {
-  assert("Impl dynamic alloc if this fails (or double outbuf size)" &&
-         (outlen + len) < int(sizeof(inbuf)));
-
-  memcpy(outbuf + outlen, data, len);
-  outlen += len;
+  outbuf.insert(outbuf.end(), data, data + len);
 }
 
 void GdbConnection::write_hex(unsigned long hex) {
@@ -329,17 +172,18 @@ void GdbConnection::write_packet(const char* data) {
 void GdbConnection::write_binary_packet(const char* pfx, const uint8_t* data,
                                         ssize_t num_bytes) {
   ssize_t pfx_num_chars = strlen(pfx);
-  uint8_t buf[2 * num_bytes + pfx_num_chars];
+  vector<uint8_t> buf;
+  buf.resize(2 * num_bytes + pfx_num_chars);
   ssize_t buf_num_bytes = 0;
   int i;
 
-  strncpy((char*)buf, pfx, sizeof(buf) - 1);
+  strncpy((char*)buf.data(), pfx, buf.size() - 1);
   buf_num_bytes += pfx_num_chars;
 
   for (i = 0; i < num_bytes; ++i) {
     uint8_t b = data[i];
 
-    if (buf_num_bytes + 2 > ssize_t(sizeof(buf))) {
+    if (buf_num_bytes + 2 > ssize_t(buf.size())) {
       break;
     }
     switch (b) {
@@ -347,32 +191,40 @@ void GdbConnection::write_binary_packet(const char* pfx, const uint8_t* data,
       case '$':
       case '}':
       case '*':
-        buf[buf_num_bytes++] = '}';
-        buf[buf_num_bytes++] = b ^ 0x20;
+        buf.data()[buf_num_bytes++] = '}';
+        buf.data()[buf_num_bytes++] = b ^ 0x20;
         break;
       default:
-        buf[buf_num_bytes++] = b;
+        buf.data()[buf_num_bytes++] = b;
         break;
     }
   }
 
   LOG(debug) << " ***** NOTE: writing binary data, upcoming debug output may "
                 "be truncated";
-  return write_packet_bytes(buf, buf_num_bytes);
+  return write_packet_bytes(buf.data(), buf_num_bytes);
 }
 
-void GdbConnection::write_hex_bytes_packet(const uint8_t* bytes, size_t len) {
-  if (0 == len) {
+void GdbConnection::write_hex_bytes_packet(const char* prefix,
+                                           const uint8_t* bytes, size_t len) {
+  if (prefix[0] == '\0' && 0 == len) {
     write_packet("");
     return;
   }
 
-  char buf[2 * len + 1];
+  ssize_t pfx_num_chars = strlen(prefix);
+  vector<char> buf;
+  buf.resize(pfx_num_chars + 2 * len + 1);
+  memcpy(buf.data(), prefix, pfx_num_chars);
   for (size_t i = 0; i < len; ++i) {
     unsigned long b = bytes[i];
-    snprintf(&buf[2 * i], 3, "%02lx", b);
+    snprintf(&buf.data()[pfx_num_chars + 2 * i], 3, "%02lx", b);
   }
-  write_packet(buf);
+  write_packet(buf.data());
+}
+
+void GdbConnection::write_hex_bytes_packet(const uint8_t* bytes, size_t len) {
+  write_hex_bytes_packet("", bytes, len);
 }
 
 static void parser_assert(bool cond) {
@@ -398,28 +250,25 @@ static string decode_ascii_encoded_hex_str(const char* encoded) {
 }
 
 bool GdbConnection::skip_to_packet_start() {
-  uint8_t* p = nullptr;
-  int i;
-
+  ssize_t end = -1;
   /* XXX we want memcspn() here ... */
-  for (i = 0; i < inlen; ++i) {
+  for (size_t i = 0; i < inbuf.size(); ++i) {
     if (inbuf[i] == '$' || inbuf[i] == INTERRUPT_CHAR) {
-      p = &inbuf[i];
+      end = i;
       break;
     }
   }
 
-  if (!p) {
+  if (end < 0) {
     /* Discard all read bytes, which we don't care
      * about. */
-    inlen = 0;
+    inbuf.clear();
     return false;
   }
   /* Discard bytes up to start-of-packet. */
-  memmove(inbuf, p, inlen - (p - inbuf));
-  inlen -= (p - inbuf);
+  inbuf.erase(inbuf.begin(), inbuf.begin() + end);
 
-  parser_assert(1 <= inlen);
+  parser_assert(1 <= inbuf.size());
   parser_assert('$' == inbuf[0] || INTERRUPT_CHAR == inbuf[0]);
   return true;
 }
@@ -429,14 +278,11 @@ bool GdbConnection::sniff_packet() {
     /* We've already seen a (possibly partial) packet. */
     return true;
   }
-  parser_assert(0 == inlen);
+  parser_assert(inbuf.empty());
   return poll_incoming(sock_fd, 0 /*don't wait*/);
 }
 
 void GdbConnection::read_packet() {
-  uint8_t* p;
-  size_t checkedlen;
-
   /* Read and discard bytes until we see the start of a
    * packet.
    *
@@ -446,8 +292,12 @@ void GdbConnection::read_packet() {
    * somehow magically fix our bug that led to the malformed
    * packet in the first place.
    */
-  while (!skip_to_packet_start()) {
+  while (!skip_to_packet_start() && connection_alive_) {
     read_data_once();
+  }
+
+  if (!connection_alive_) {
+    return;
   }
 
   if (inbuf[0] == INTERRUPT_CHAR) {
@@ -458,16 +308,26 @@ void GdbConnection::read_packet() {
   }
 
   /* Read until we see end-of-packet. */
-  for (checkedlen = 0; !(p = (uint8_t*)memchr(inbuf + checkedlen, '#', inlen));
-       checkedlen = inlen) {
+  size_t checkedlen = 0;
+  while (true) {
+    uint8_t* p = (uint8_t*)memchr(inbuf.data() + checkedlen, '#',
+                                  inbuf.size() - checkedlen);
+    if (p) {
+      packetend = p - inbuf.data();
+      break;
+    }
+    checkedlen = inbuf.size();
     read_data_once();
+    if (!connection_alive_) {
+      return;
+    }
   }
-  packetend = (p - inbuf);
+
   /* NB: we're ignoring the gdb packet checksums here too.  If
    * gdb is corrupted enough to garble a checksum over TCP, it's
    * not really clear why asking for the packet again might make
    * the bug go away. */
-  parser_assert('$' == inbuf[0] && packetend < inlen);
+  parser_assert('$' == inbuf[0] && packetend < inbuf.size());
 
   /* Acknowledge receipt of the packet. */
   if (!no_ack) {
@@ -517,43 +377,137 @@ static GdbThreadId parse_threadid(const char* str, char** endptr) {
   return t;
 }
 
-bool GdbConnection::xfer(const char* name, char* args) {
-  LOG(debug) << "gdb asks us to transfer " << name << "(" << args << ")";
-
-  if (!strcmp(name, "auxv")) {
-    parser_assert(!strncmp(args, "read::", sizeof("read::") - 1));
-
-    req = GdbRequest(DREQ_GET_AUXV);
-    req.target = query_thread;
-    return true;
+void GdbConnection::write_xfer_response(const void* data, size_t size,
+                                        uint64_t offset, uint64_t len) {
+  if (offset > size) {
+    write_packet("E01");
+    return;
   }
-  if (name == strstr(name, "siginfo")) {
-    if (args == strstr(args, "read")) {
-      req = GdbRequest(DREQ_READ_SIGINFO);
-      req.target = query_thread;
-      args += strlen("read");
-      parser_assert(':' == *args++);
-      parser_assert(':' == *args++);
+  if (offset == size) {
+    write_packet("l");
+    return;
+  }
+  if (offset + len < size) {
+    write_binary_packet("m", static_cast<const uint8_t*>(data) + offset, len);
+    return;
+  }
+  write_binary_packet("l", static_cast<const uint8_t*>(data) + offset,
+                      size - offset);
+}
 
-      req.mem().addr = strtoul(args, &args, 16);
-      parser_assert(',' == *args++);
-
-      req.mem().len = strtoul(args, &args, 16);
-      parser_assert('\0' == *args);
-
-      return true;
+static string read_target_desc(const char* file_name) {
+  string path = exe_directory() + "../share/rr/" + string(file_name);
+  stringstream ss;
+  FILE* f = fopen(path.c_str(), "r");
+  assert(f);
+  while (true) {
+    int ch = getc(f);
+    if (ch == EOF) {
+      break;
     }
-    if (args == strstr(args, "write")) {
-      req = GdbRequest(DREQ_WRITE_SIGINFO);
-      req.target = query_thread;
-      return true;
-    }
-    UNHANDLED_REQ() << "Unhandled 'siginfo' request: " << args;
+    ss << (char)ch;
+  }
+  fclose(f);
+  return ss.str();
+}
+
+static const char* target_description_name(uint32_t cpu_features) {
+  // This doesn't scale, but it's what gdb does...
+  switch (cpu_features) {
+    case 0:
+      return "i386-linux.xml";
+    case GdbConnection::CPU_64BIT:
+      return "amd64-linux.xml";
+    case GdbConnection::CPU_AVX:
+      return "i386-avx-linux.xml";
+    case GdbConnection::CPU_64BIT | GdbConnection::CPU_AVX:
+      return "amd64-avx-linux.xml";
+    default:
+      FATAL() << "Unknown features";
+      return nullptr;
+  }
+}
+
+bool GdbConnection::xfer(const char* name, char* args) {
+  const char* mode = args;
+  args = strchr(args, ':');
+  parser_assert(args);
+  *args++ = '\0';
+
+  if (strcmp(mode, "read") && strcmp(mode, "write")) {
+    write_packet("");
     return false;
   }
 
-  UNHANDLED_REQ() << "Unhandled gdb xfer request: " << name << "(" << args
-                  << ")";
+  const char* annex = args;
+  args = strchr(args, ':');
+  parser_assert(args);
+  *args++ = '\0';
+
+  uint64_t offset = strtoul(args, &args, 16);
+
+  uint64_t len = 0;
+  if (!strcmp(mode, "read")) {
+    parser_assert(',' == *args++);
+    len = strtoul(args, &args, 16);
+    parser_assert(!*args);
+  } else {
+    parser_assert(*args == ':');
+    ++args;
+  }
+
+  LOG(debug) << "gdb asks us to transfer " << name << " mode=" << mode
+             << ", annex=" << annex << ", offset=" << offset << " len=" << len;
+
+  if (!strcmp(name, "auxv")) {
+    if (strcmp(annex, "")) {
+      write_packet("E00");
+      return false;
+    }
+    if (strcmp(mode, "read")) {
+      write_packet("");
+      return false;
+    }
+
+    req = GdbRequest(DREQ_GET_AUXV);
+    req.target = query_thread;
+    // XXX handle offset/len here!
+    return true;
+  }
+
+  if (!strcmp(name, "siginfo")) {
+    if (strcmp(annex, "")) {
+      write_packet("E00");
+      return false;
+    }
+    if (!strcmp(mode, "read")) {
+      req = GdbRequest(DREQ_READ_SIGINFO);
+      req.target = query_thread;
+      req.mem().addr = offset;
+      req.mem().len = len;
+      return true;
+    }
+
+    req = GdbRequest(DREQ_WRITE_SIGINFO);
+    req.target = query_thread;
+    return true;
+  }
+
+  if (!strcmp(name, "features")) {
+    if (strcmp(mode, "read")) {
+      write_packet("");
+      return false;
+    }
+
+    string target_desc =
+        read_target_desc((strcmp(annex, "") && strcmp(annex, "target.xml"))
+                             ? annex
+                             : target_description_name(cpu_features_));
+    write_xfer_response(target_desc.c_str(), target_desc.size(), offset, len);
+    return false;
+  }
+
+  write_packet("");
   return false;
 }
 
@@ -647,9 +601,18 @@ bool GdbConnection::query(char* payload) {
   }
   if (!strcmp(name, "GetTLSAddr")) {
     LOG(debug) << "gdb asks for TLS addr";
-    /* TODO */
-    write_packet("");
-    return false;
+    req = GdbRequest(DREQ_TLS);
+    req.target = parse_threadid(args, &args);
+    parser_assert(*args == ',');
+    ++args;
+    size_t offset = strtoul(args, &args, 16);
+    parser_assert(*args == ',');
+    ++args;
+    remote_ptr<void> load_module = strtoul(args, &args, 16);
+    parser_assert(*args == '\0');
+    req.tls().offset = offset;
+    req.tls().load_module = load_module;
+    return true;
   }
   if (!strcmp(name, "Offsets")) {
     LOG(debug) << "gdb asks for section offsets";
@@ -667,8 +630,10 @@ bool GdbConnection::query(char* payload) {
     LOG(debug) << "gdb supports " << args;
 
     stringstream supported;
-    supported << "PacketSize=" << sizeof(outbuf);
-    supported << ";QStartNoAckMode+"
+    // Encourage gdb to use very large packets since we support any packet size
+    supported << "PacketSize=1048576"
+                 ";QStartNoAckMode+"
+                 ";qXfer:features:read+"
                  ";qXfer:auxv:read+"
                  ";qXfer:siginfo:read+"
                  ";qXfer:siginfo:write+"
@@ -683,8 +648,19 @@ bool GdbConnection::query(char* payload) {
   }
   if (!strcmp(name, "Symbol")) {
     LOG(debug) << "gdb is ready for symbol lookups";
-    write_packet("OK");
-    return false;
+    const char* colon = strchr(args, ':');
+    parser_assert(colon != nullptr);
+    req = GdbRequest(DREQ_QSYMBOL);
+    if (*args == ':') {
+      req.sym().has_address = false;
+    } else {
+      req.sym().has_address = true;
+      req.sym().address = strtoul(args, &args, 16);
+    }
+    parser_assert(*args == ':');
+    ++args;
+    req.sym().name = decode_ascii_encoded_hex_str(args);
+    return true;
   }
   if (strstr(name, "ThreadExtraInfo") == name) {
     // ThreadExtraInfo is a special snowflake that
@@ -710,9 +686,9 @@ bool GdbConnection::query(char* payload) {
   if (!strcmp(name, "Xfer")) {
     name = args;
     args = strchr(args, ':');
-    if (args) {
-      *args++ = '\0';
-    }
+    parser_assert(args);
+    *args++ = '\0';
+
     return xfer(name, args);
   }
   if (!strcmp(name, "Search")) {
@@ -728,7 +704,8 @@ bool GdbConnection::query(char* payload) {
       parser_assert(';' == *args++);
       req.mem().len = strtoul(args, &args, 16);
       parser_assert(';' == *args++);
-      read_binary_data((const uint8_t*)args, inbuf + packetend, req.mem().data);
+      read_binary_data((const uint8_t*)args, inbuf.data() + packetend,
+                       req.mem().data);
 
       LOG(debug) << "gdb searching memory (addr=" << HEX(req.mem().addr)
                  << ", len=" << req.mem().len << ")";
@@ -943,31 +920,40 @@ bool GdbConnection::process_vpacket(char* payload) {
   return false;
 }
 
-bool GdbConnection::process_packet() {
-  char request;
-  char* payload = nullptr;
-  bool ret;
+static string to_string(const vector<uint8_t>& bytes, size_t max_len) {
+  stringstream ss;
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    if (i >= max_len) {
+      ss << "...";
+      break;
+    }
+    char buf[3];
+    sprintf(buf, "%02x", bytes[i]);
+    ss << buf;
+  }
+  return ss.str();
+}
 
+bool GdbConnection::process_packet() {
   parser_assert(INTERRUPT_CHAR == inbuf[0] ||
                 ('$' == inbuf[0] &&
-                 (((uint8_t*)memchr(inbuf, '#', inlen) - inbuf) == packetend)));
+                 (uint8_t*)memchr(inbuf.data(), '#', inbuf.size()) ==
+                     inbuf.data() + packetend));
 
   if (INTERRUPT_CHAR == inbuf[0]) {
-    request = INTERRUPT_CHAR;
-  } else {
-    request = inbuf[1];
-    payload = (char*)&inbuf[2];
-    inbuf[packetend] = '\0';
+    LOG(debug) << "gdb requests interrupt";
+    req = GdbRequest(DREQ_INTERRUPT);
+    inbuf.erase(inbuf.begin());
+    return true;
   }
 
+  char request = inbuf[1];
+  char* payload = (char*)&inbuf[2];
+  inbuf[packetend] = '\0';
   LOG(debug) << "raw request " << request << payload;
 
+  bool ret;
   switch (request) {
-    case INTERRUPT_CHAR:
-      LOG(debug) << "gdb requests interrupt";
-      req = GdbRequest(DREQ_INTERRUPT);
-      ret = true;
-      break;
     case 'b':
       ret = process_bpacket(payload);
       break;
@@ -1071,12 +1057,13 @@ bool GdbConnection::process_packet() {
       parser_assert(',' == *payload++);
       req.mem().len = strtoul(payload, &payload, 16);
       parser_assert(':' == *payload++);
-      read_binary_data((const uint8_t*)payload, inbuf + packetend,
+      read_binary_data((const uint8_t*)payload, inbuf.data() + packetend,
                        req.mem().data);
       parser_assert(req.mem().len == req.mem().data.size());
 
       LOG(debug) << "gdb setting memory (addr=" << HEX(req.mem().addr)
-                 << ", len=" << req.mem().len << ")";
+                 << ", len=" << req.mem().len
+                 << ", data=" << to_string(req.mem().data, 32) << ")";
 
       ret = true;
       break;
@@ -1140,9 +1127,10 @@ bool GdbConnection::process_packet() {
       UNHANDLED_REQ() << "Unhandled gdb request '" << inbuf[1] << "'";
       ret = false;
   }
-  /* Erase the newly processed packet from the input buffer. */
-  memmove(inbuf, inbuf + packetend, inlen - packetend);
-  inlen = (inlen - packetend);
+  /* Erase the newly processed packet from the input buffer. The checksum
+   * after the '#' will be skipped later as we look for the next packet start.
+   */
+  inbuf.erase(inbuf.begin(), inbuf.begin() + packetend + 1);
 
   /* If we processed the request internally, consume it. */
   if (!ret) {
@@ -1210,6 +1198,10 @@ GdbRequest GdbConnection::get_request() {
      * to do.  Either way, block until we read a complete
      * packet from gdb. */
     read_packet();
+
+    if (!connection_alive_) {
+      return req = GdbRequest(DREQ_DETACH);
+    }
 
     if (process_packet()) {
       /* We couldn't process the packet internally,
@@ -1492,15 +1484,14 @@ void GdbConnection::reply_get_reg(const GdbRegisterValue& reg) {
   consume_request();
 }
 
-void GdbConnection::reply_get_regs(const GdbRegisterFile& file) {
-  size_t n_regs = file.total_registers();
-  char buf[n_regs * 2 * GdbRegisterValue::MAX_SIZE + 1];
+void GdbConnection::reply_get_regs(const vector<GdbRegisterValue>& file) {
+  char buf[file.size() * 2 * GdbRegisterValue::MAX_SIZE + 1];
 
   assert(DREQ_GET_REGS == req.type);
 
   size_t offset = 0;
-  for (auto it = file.regs.begin(), end = file.regs.end(); it != end; ++it) {
-    offset += print_reg_value(*it, &buf[offset]);
+  for (auto& reg : file) {
+    offset += print_reg_value(reg, &buf[offset]);
   }
   write_packet(buf);
 
@@ -1541,7 +1532,7 @@ void GdbConnection::reply_get_thread_list(const vector<GdbThreadId>& threads) {
         1 /*m char*/ +
         threads.size() * (1 /*p*/ + 2 * sizeof(threads[0]) + 1 /*,*/) +
         1 /*\0*/;
-    char* str = (char*)malloc(maxlen);
+    char* str = (char*)xmalloc(maxlen);
     int offset = 0;
 
     str[offset++] = 'm';
@@ -1606,3 +1597,39 @@ void GdbConnection::reply_rr_cmd(const std::string& text) {
 
   consume_request();
 }
+
+void GdbConnection::send_qsymbol(const std::string& name) {
+  assert(DREQ_QSYMBOL == req.type);
+
+  const void* data = static_cast<const void*>(name.c_str());
+  write_hex_bytes_packet("qSymbol:", static_cast<const uint8_t*>(data),
+                         name.length());
+
+  consume_request();
+}
+
+void GdbConnection::qsymbols_finished() {
+  assert(DREQ_QSYMBOL == req.type);
+
+  write_packet("OK");
+
+  consume_request();
+}
+
+void GdbConnection::reply_tls_addr(bool ok, remote_ptr<void> address) {
+  assert(DREQ_TLS == req.type);
+
+  if (ok) {
+    char buf[256];
+    sprintf(buf, "%llx", (long long)address.as_int());
+    write_packet(buf);
+  } else {
+    write_packet("E01");
+  }
+
+  consume_request();
+}
+
+bool GdbConnection::is_connection_alive() { return connection_alive_; }
+
+} // namespace rr

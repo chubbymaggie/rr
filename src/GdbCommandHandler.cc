@@ -1,15 +1,15 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "GdbCommandHandler"
-
-#include "GdbCommand.h"
 #include "GdbCommandHandler.h"
+#include "GdbCommand.h"
 #include "log.h"
 
 #include <sstream>
 #include <vector>
 
 using namespace std;
+
+namespace rr {
 
 // HashMap would be better here but the unordered_map API is annoying
 // and linear search is fine.
@@ -101,8 +101,15 @@ class RRCmd(gdb.Command):
         response = gdb_unescape(rv_match.group(1))
         gdb.write(response)
 
-end
+def history_push(p):
+    gdb.execute("rr-history-push", to_string=True)
 
+#Automatically push an history entry when the program execution stops
+#(signal, breakpoint).This is fired before an interactive prompt is shown.
+#Disabled for now since it's not fully working.
+#gdb.events.stop.connect(history_push)
+
+end
 )Delimiter");
 
   if (gdb_command_list) {
@@ -110,6 +117,17 @@ end
       ss << gdb_macro_binding(*it);
     }
   }
+
+  ss << string(R"Delimiter(
+define hookpost-back
+frame
+end
+
+define hookpost-forward
+frame
+end
+)Delimiter");
+
   return ss.str();
 }
 
@@ -176,6 +194,14 @@ static vector<string> parse_cmd(string& str) {
   }
   LOG(debug) << "invoking command: " << cmd->name();
   string resp = cmd->invoke(gdb_server, t, args);
+
+  if (resp == GdbCommandHandler::cmd_end_diversion()) {
+    LOG(debug) << "cmd must run outside of diversion (" << resp << ")";
+    return resp;
+  }
+
   LOG(debug) << "cmd response: " << resp;
   return gdb_escape(resp + "\n");
 }
+
+} // namespace rr

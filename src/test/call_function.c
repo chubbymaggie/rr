@@ -9,12 +9,12 @@ static void breakpoint(void) {
   (void)break_here;
 }
 
-static void mutate_var(void) {
+void mutate_var(void) {
   var = 22;
   atomic_printf("var is %d\n", var);
 }
 
-static void print_nums(void) {
+void print_nums(void) {
   int i;
   for (i = 1; i <= 5; ++i) {
     atomic_printf("%d ", i);
@@ -22,7 +22,7 @@ static void print_nums(void) {
   atomic_puts("");
 }
 
-static void alloc_and_print(void) {
+void alloc_and_print(void) {
   static const int num_bytes = 4096;
   char* str = mmap(NULL, num_bytes, PROT_WRITE | PROT_READ,
                    MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
@@ -33,7 +33,7 @@ static void alloc_and_print(void) {
   munmap(str, num_bytes);
 }
 
-static void make_unhandled_syscall(void) {
+void make_unhandled_syscall(void) {
   ssize_t ret = kill(getpid(), SIGKILL);
   /* XXX the error return is somewhat arbitrary here, but as
    * long as |splice()| remains unimplemented in experiment
@@ -42,13 +42,21 @@ static void make_unhandled_syscall(void) {
   atomic_printf("return from kill: %zd\n", ret);
 }
 
-static void print_time(void) {
+void print_time(void) {
   struct timespec ts = { -1, -1 };
   double now_sec;
 
   clock_gettime(CLOCK_MONOTONIC, &ts);
   now_sec = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
   atomic_printf("now is %g sec\n", now_sec);
+}
+
+static void make_stack_executable(void) {
+  int v = 0;
+  size_t page_size = sysconf(_SC_PAGESIZE);
+  void* p = (void*)((uintptr_t)&v & ~((uintptr_t)page_size - 1));
+  int ret = mprotect(p, page_size, PROT_READ | PROT_WRITE | PROT_EXEC);
+  test_assert(ret == 0 || errno == EACCES);
 }
 
 int main(void) {
@@ -58,6 +66,10 @@ int main(void) {
 
   atomic_printf("var is %d\n", var);
   test_assert(var == -42);
+
+  make_stack_executable();
+
+  breakpoint();
 
   atomic_puts("EXIT-SUCCESS");
   return 0;

@@ -79,7 +79,7 @@ exit = IrregularEmulatedSyscall(x86=1, x64=60)
 
 # Obsolete, glibc calls clone() instead.
 # But Google Breakpad uses it!
-fork = EmulatedSyscall(x86=2, x64=57)
+fork = IrregularEmulatedSyscall(x86=2, x64=57)
 
 #  ssize_t read(int fd, void *buf, size_t count);
 #
@@ -109,7 +109,7 @@ write = IrregularEmulatedSyscall(x86=4, x64=1)
 # (read(2), write(2), lseek(2), fcntl(2), etc.).  The file descriptor
 # returned by a successful call will be the lowest-numbered file
 # descriptor not currently open for the process.
-open = EmulatedSyscall(x86=5, x64=2)
+open = IrregularEmulatedSyscall(x86=5, x64=2)
 
 #  int close(int fd)
 #
@@ -194,8 +194,8 @@ lseek = EmulatedSyscall(x86=19, x64=8)
 # filenames.)
 getpid = EmulatedSyscall(x86=20, x64=39)
 
-mount = UnsupportedSyscall(x86=21, x64=165)
-umount = UnsupportedSyscall(x86=22)
+mount = EmulatedSyscall(x86=21, x64=165)
+umount = EmulatedSyscall(x86=22)
 setuid = EmulatedSyscall(x86=23, x64=105)
 getuid = EmulatedSyscall(x86=24, x64=102)
 stime = UnsupportedSyscall(x86=25)
@@ -336,7 +336,7 @@ signal = UnsupportedSyscall(x86=48)
 geteuid = EmulatedSyscall(x86=49, x64=107)
 getegid = EmulatedSyscall(x86=50, x64=108)
 acct = UnsupportedSyscall(x86=51, x64=163)
-umount2 = UnsupportedSyscall(x86=52, x64=166)
+umount2 = EmulatedSyscall(x86=52, x64=166)
 lock = InvalidSyscall(x86=53)
 
 #  int ioctl(int d, int request, ...)
@@ -414,15 +414,15 @@ setsid = EmulatedSyscall(x86=66, x64=112)
 # If act is non-NULL, the new action for signal signum is installed
 # from act.  If oldact is non-NULL, the previous action is saved in
 # oldact.
-sigaction = EmulatedSyscall(x86=67, arg3="typename Arch::kernel_sigaction")
+sigaction = IrregularEmulatedSyscall(x86=67)
 
 sgetmask = UnsupportedSyscall(x86=68)
 ssetmask = UnsupportedSyscall(x86=69)
-setreuid = UnsupportedSyscall(x86=70, x64=113)
-setregid = UnsupportedSyscall(x86=71, x64=114)
+setreuid = EmulatedSyscall(x86=70, x64=113)
+setregid = EmulatedSyscall(x86=71, x64=114)
 sigsuspend = IrregularEmulatedSyscall(x86=72)
 sigpending = UnsupportedSyscall(x86=73)
-sethostname = UnsupportedSyscall(x86=74, x64=170)
+sethostname = EmulatedSyscall(x86=74, x64=170)
 
 #  int setrlimit(int resource, const struct rlimit *rlim)
 #
@@ -535,7 +535,7 @@ profil = InvalidSyscall(x86=98)
 # system.  path is the pathname of any file within the mounted file
 # system.  buf is a pointer to a statfs structure defined
 # approximately as follows:
-statfs = EmulatedSyscall(x86=99, x64=137, arg2="typename Arch::statfs")
+statfs = EmulatedSyscall(x86=99, x64=137, arg2="struct Arch::statfs")
 
 #  int fstatfs(int fd, struct statfs *buf)
 #
@@ -543,7 +543,7 @@ statfs = EmulatedSyscall(x86=99, x64=137, arg2="typename Arch::statfs")
 # system.  path is the pathname of any file within the
 # get_time(GET_TID(thread_id));mounted file system.  buf is a pointer
 # to a statfs structure defined approximately as follows:
-fstatfs = EmulatedSyscall(x86=100, x64=138, arg2="typename Arch::statfs")
+fstatfs = EmulatedSyscall(x86=100, x64=138, arg2="struct Arch::statfs")
 
 ioperm = UnsupportedSyscall(x86=101, x64=173)
 
@@ -565,9 +565,9 @@ syslog = UnsupportedSyscall(x86=103, x64=103)
 # stored there.
 setitimer = EmulatedSyscall(x86=104, x64=38, arg3="typename Arch::itimerval")
 getitimer = EmulatedSyscall(x86=105, x64=36, arg2="typename Arch::itimerval")
-stat = EmulatedSyscall(x86=106, x64=4, arg2="typename Arch::stat")
-lstat = EmulatedSyscall(x86=107, x64=6, arg2="typename Arch::stat")
-fstat = EmulatedSyscall(x86=108, x64=5, arg2="typename Arch::stat")
+stat = EmulatedSyscall(x86=106, x64=4, arg2="struct Arch::stat")
+lstat = EmulatedSyscall(x86=107, x64=6, arg2="struct Arch::stat")
+fstat = EmulatedSyscall(x86=108, x64=5, arg2="struct Arch::stat")
 olduname = UnsupportedSyscall(x86=109)
 iopl = UnsupportedSyscall(x86=110, x64=172)
 vhangup = UnsupportedSyscall(x86=111, x64=153)
@@ -587,7 +587,7 @@ swapoff = UnsupportedSyscall(x86=115, x64=168)
 #
 # sysinfo() provides a simple way of getting overall system
 # statistics.
-sysinfo = EmulatedSyscall(x86=116, x64=99, arg1="typename Arch::sysinfo")
+sysinfo = EmulatedSyscall(x86=116, x64=99, arg1="struct Arch::sysinfo")
 #  int ipc(unsigned int call, int first, int second, int third, void *ptr, long
 #fifth);
 #
@@ -612,7 +612,7 @@ fsync = EmulatedSyscall(x86=118, x64=74)
 # When the Linux kernel creates the stack frame for a signal handler,
 # a call to sigreturn() is inserted into the stack frame so that upon
 # return from the signal handler, sigreturn() will be called.
-sigreturn = EmulatedSyscall(x86=119)
+sigreturn = IrregularEmulatedSyscall(x86=119)
 
 #  int clone(int (*fn)(void *), void *child_stack, int flags, void *arg, (pid_t
 #*ptid, struct user_desc *tls, pid_t *ctid));
@@ -630,7 +630,7 @@ sigreturn = EmulatedSyscall(x86=119)
 #*parent_tid, void __user *child_tid, struct pt_regs *regs)
 clone = IrregularEmulatedSyscall(x86=120, x64=56)
 
-setdomainname = UnsupportedSyscall(x86=121, x64=171)
+setdomainname = EmulatedSyscall(x86=121, x64=171)
 
 #  int uname(struct utsname *buf)
 #
@@ -638,8 +638,13 @@ setdomainname = UnsupportedSyscall(x86=121, x64=171)
 # buf. The utsname struct is defined in <sys/utsname.h>:
 uname = EmulatedSyscall(x86=122, x64=63, arg1="typename Arch::utsname")
 
-modify_ldt = UnsupportedSyscall(x86=123, x64=154)
-adjtimex = UnsupportedSyscall(x86=124, x64=159)
+modify_ldt = IrregularEmulatedSyscall(x86=123, x64=154)
+
+#  int adjtimex(struct timex *buf);
+#
+# adjtimex() takes a pointer to a timex structure, reads it, and returns
+# the same structure updated with the current kernel values.
+adjtimex = EmulatedSyscall(x86=124, x64=159, arg1="typename Arch::timex")
 
 #  int mprotect(const void *addr, size_t len, int prot)
 #
@@ -663,7 +668,7 @@ sigprocmask = IrregularEmulatedSyscall(x86=126)
 create_module = UnsupportedSyscall(x86=127, x64=174)
 init_module = UnsupportedSyscall(x86=128, x64=175)
 delete_module = UnsupportedSyscall(x86=129, x64=176)
-get_kernel_syms = UnsupportedSyscall(x86=130, x64=177)
+get_kernel_syms = InvalidSyscall(x86=130, x64=177)
 
 #  int quotactl(int cmd, const char *special, int id, caddr_t addr);
 #
@@ -692,8 +697,8 @@ bdflush = UnsupportedSyscall(x86=134)
 sysfs = UnsupportedSyscall(x86=135, x64=139)
 personality = IrregularEmulatedSyscall(x86=136, x64=135)
 afs_syscall = InvalidSyscall(x86=137, x64=183)
-setfsuid = UnsupportedSyscall(x86=138, x64=122)
-setfsgid = UnsupportedSyscall(x86=139, x64=123)
+setfsuid = EmulatedSyscall(x86=138, x64=122)
+setfsgid = EmulatedSyscall(x86=139, x64=123)
 
 #  int _llseek(unsigned int fd, unsigned long offset_high, unsigned long
 #offset_low, loff_t *result, unsigned int whence);
@@ -847,7 +852,7 @@ nanosleep = IrregularEmulatedSyscall(x86=162, x64=35)
 # mremap() expands (or shrinks) an existing memory mapping,
 # potentially moving it at the same time (controlled by the flags
 # argument and the available virtual address space).
-mremap = EmulatedSyscall(x86=163, x64=25)
+mremap = IrregularEmulatedSyscall(x86=163, x64=25)
 
 #  int setresuid(uid_t ruid, uid_t euid, uid_t suid);
 #
@@ -894,8 +899,8 @@ getresgid = EmulatedSyscall(x86=171, x64=120, arg1="typename Arch::legacy_gid_t"
 #
 prctl = IrregularEmulatedSyscall(x86=172, x64=157)
 
-rt_sigreturn = EmulatedSyscall(x86=173, x64=15)
-rt_sigaction = EmulatedSyscall(x86=174, x64=13, arg3="typename Arch::kernel_sigaction")
+rt_sigreturn = IrregularEmulatedSyscall(x86=173, x64=15)
+rt_sigaction = IrregularEmulatedSyscall(x86=174, x64=13)
 rt_sigprocmask = IrregularEmulatedSyscall(x86=175, x64=14)
 
 #  int sigpending(sigset_t *set);
@@ -978,20 +983,20 @@ ftruncate64 = EmulatedSyscall(x86=194)
 # int stat(const char *path, struct stat *buf);
 #
 # stat() stats the file pointed to by path and fills in buf.
-stat64 = EmulatedSyscall(x86=195, arg2="typename Arch::stat64")
+stat64 = EmulatedSyscall(x86=195, arg2="struct Arch::stat64")
 
 #  int lstat(const char *path, struct stat *buf);
 #
 # lstat() is identical to stat(), except that if path is a symbolic
 # link, then the link itself is stat-ed, not the file that it refers
 # to.
-lstat64 = EmulatedSyscall(x86=196, arg2="typename Arch::stat64")
+lstat64 = EmulatedSyscall(x86=196, arg2="struct Arch::stat64")
 
 #  int fstat(int fd, struct stat *buf)
 #
 # fstat() is identical to stat(), except that the file to be stat-ed
 # is specified by the file descriptor fd.
-fstat64 = EmulatedSyscall(x86=197, arg2="typename Arch::stat64")
+fstat64 = EmulatedSyscall(x86=197, arg2="struct Arch::stat64")
 
 lchown32 = EmulatedSyscall(x86=198)
 
@@ -1015,7 +1020,7 @@ geteuid32 = EmulatedSyscall(x86=201)
 # getegid() returns the effective group ID of the calling process.
 getegid32 = EmulatedSyscall(x86=202)
 
-setreuid32 = UnsupportedSyscall(x86=203)
+setreuid32 = EmulatedSyscall(x86=203)
 
 #  int setregid(gid_t rgid, gid_t egid)
 #
@@ -1075,9 +1080,9 @@ getresgid32 = EmulatedSyscall(x86=211, arg1="typename Arch::gid_t", arg2="typena
 chown32 = EmulatedSyscall(x86=212)
 setuid32 = EmulatedSyscall(x86=213)
 setgid32 = EmulatedSyscall(x86=214)
-setfsuid32 = UnsupportedSyscall(x86=215)
-setfsgid32 = UnsupportedSyscall(x86=216)
-pivot_root = UnsupportedSyscall(x86=217, x64=155)
+setfsuid32 = EmulatedSyscall(x86=215)
+setfsgid32 = EmulatedSyscall(x86=216)
+pivot_root = EmulatedSyscall(x86=217, x64=155)
 mincore = IrregularEmulatedSyscall(x86=218, x64=27)
 
 #  int madvise(void *addr, size_t length, int advice);
@@ -1143,13 +1148,13 @@ getxattr = IrregularEmulatedSyscall(x86=229, x64=191)
 lgetxattr = IrregularEmulatedSyscall(x86=230, x64=192)
 fgetxattr = IrregularEmulatedSyscall(x86=231, x64=193)
 
-listxattr = UnsupportedSyscall(x86=232, x64=194)
-llistxattr = UnsupportedSyscall(x86=233, x64=195)
-flistxattr = UnsupportedSyscall(x86=234, x64=196)
+listxattr = IrregularEmulatedSyscall(x86=232, x64=194)
+llistxattr = IrregularEmulatedSyscall(x86=233, x64=195)
+flistxattr = IrregularEmulatedSyscall(x86=234, x64=196)
 removexattr = EmulatedSyscall(x86=235, x64=197)
 lremovexattr = EmulatedSyscall(x86=236, x64=198)
 fremovexattr = EmulatedSyscall(x86=237, x64=199)
-tkill = UnsupportedSyscall(x86=238, x64=200)
+tkill = EmulatedSyscall(x86=238, x64=200)
 
 # ssize_t sendfile64 (int __out_fd, int __in_fd, __off64_t *__offset, size_t
 #__count);
@@ -1205,7 +1210,7 @@ sched_getaffinity = IrregularEmulatedSyscall(x86=242, x64=204)
 # changed.
 set_thread_area = IrregularEmulatedSyscall(x86=243, x64=205)
 
-get_thread_area = UnsupportedSyscall(x86=244, x64=211)
+get_thread_area = IrregularEmulatedSyscall(x86=244, x64=211)
 io_setup = UnsupportedSyscall(x86=245, x64=206)
 io_destroy = UnsupportedSyscall(x86=246, x64=207)
 io_getevents = UnsupportedSyscall(x86=247, x64=208)
@@ -1296,7 +1301,7 @@ clock_gettime = EmulatedSyscall(x86=265, x64=228, arg2="typename Arch::timespec"
 # truncated to a multiple of res.
 clock_getres = EmulatedSyscall(x86=266, x64=229, arg2="typename Arch::timespec")
 
-clock_nanosleep = UnsupportedSyscall(x86=267, x64=230)
+clock_nanosleep = IrregularEmulatedSyscall(x86=267, x64=230)
 
 #  int statfs(const char *path, struct statfs *buf)
 #
@@ -1307,8 +1312,8 @@ clock_nanosleep = UnsupportedSyscall(x86=267, x64=230)
 #
 # FIXME: we use arg3() here, although according to man pages this system
 # call has only 2 paramaters. However, strace tells another story...
-statfs64 = EmulatedSyscall(x86=268, arg3="typename Arch::statfs64")
-fstatfs64 = EmulatedSyscall(x86=269, arg3="typename Arch::statfs64")
+statfs64 = EmulatedSyscall(x86=268, arg3="struct Arch::statfs64")
+fstatfs64 = EmulatedSyscall(x86=269, arg3="struct Arch::statfs64")
 
 #  int tgkill(int tgid, int tid, int sig)
 #
@@ -1331,14 +1336,16 @@ fadvise64_64 = EmulatedSyscall(x86=272)
 
 vserver = InvalidSyscall(x86=273, x64=236)
 mbind = EmulatedSyscall(x86=274, x64=237)
-get_mempolicy = UnsupportedSyscall(x86=275, x64=239)
-set_mempolicy = UnsupportedSyscall(x86=276, x64=238)
-mq_open = UnsupportedSyscall(x86=277, x64=240)
-mq_unlink = UnsupportedSyscall(x86=278, x64=241)
-mq_timedsend = UnsupportedSyscall(x86=279, x64=242)
-mq_timedreceive = UnsupportedSyscall(x86=280, x64=243)
-mq_notify = UnsupportedSyscall(x86=281, x64=244)
-mq_getsetattr = UnsupportedSyscall(x86=282, x64=245)
+get_mempolicy = IrregularEmulatedSyscall(x86=275, x64=239)
+set_mempolicy = EmulatedSyscall(x86=276, x64=238)
+
+mq_open = EmulatedSyscall(x86=277, x64=240)
+mq_unlink = EmulatedSyscall(x86=278, x64=241)
+mq_timedsend = EmulatedSyscall(x86=279, x64=242)
+mq_timedreceive = IrregularEmulatedSyscall(x86=280, x64=243)
+mq_notify = EmulatedSyscall(x86=281, x64=244)
+mq_getsetattr = EmulatedSyscall(x86=282, x64=245, arg3="struct Arch::mq_attr")
+
 kexec_load = UnsupportedSyscall(x86=283, x64=246)
 
 #  int waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options);
@@ -1351,9 +1358,9 @@ kexec_load = UnsupportedSyscall(x86=283, x64=246)
 # nonzero value in this field after the call returns.
 waitid = IrregularEmulatedSyscall(x86=284, x64=247)
 
-add_key = UnsupportedSyscall(x86=286, x64=248)
+add_key = EmulatedSyscall(x86=286, x64=248)
 request_key = UnsupportedSyscall(x86=287, x64=249)
-keyctl = UnsupportedSyscall(x86=288, x64=250)
+keyctl = IrregularEmulatedSyscall(x86=288, x64=250)
 ioprio_set = UnsupportedSyscall(x86=289, x64=251)
 ioprio_get = UnsupportedSyscall(x86=290, x64=252)
 
@@ -1388,7 +1395,7 @@ migrate_pages = UnsupportedSyscall(x86=294, x64=256)
 #
 # The openat() system call operates in exactly the same way as
 # open(2), except for the differences described in this manual page.
-openat = EmulatedSyscall(x86=295, x64=257)
+openat = IrregularEmulatedSyscall(x86=295, x64=257)
 
 #  int mkdirat(int dirfd, const char *pathname, mode_t mode);
 #
@@ -1397,8 +1404,8 @@ openat = EmulatedSyscall(x86=295, x64=257)
 # page....
 mkdirat = EmulatedSyscall(x86=296, x64=258)
 
-mknodat = UnsupportedSyscall(x86=297, x64=259)
-fchownat = UnsupportedSyscall(x86=298, x64=260)
+mknodat = EmulatedSyscall(x86=297, x64=259)
+fchownat = EmulatedSyscall(x86=298, x64=260)
 futimesat = UnsupportedSyscall(x86=299, x64=261)
 
 #  int fstatat(int dirfd, const char *pathname, struct stat *buf, int flags);
@@ -1406,7 +1413,7 @@ futimesat = UnsupportedSyscall(x86=299, x64=261)
 # The fstatat() system call operates in exactly the same way as
 # stat(2), except for the differences described in this manual
 # page....
-fstatat64 = EmulatedSyscall(x86=300, x64=262, arg3="typename Arch::stat64")
+fstatat64 = EmulatedSyscall(x86=300, x64=262, arg3="struct Arch::stat64")
 
 #  int unlinkat(int dirfd, const char *pathname, int flags)
 #
@@ -1416,11 +1423,11 @@ fstatat64 = EmulatedSyscall(x86=300, x64=262, arg3="typename Arch::stat64")
 # described in this manual page.
 unlinkat = EmulatedSyscall(x86=301, x64=263)
 
-renameat = UnsupportedSyscall(x86=302, x64=264)
-linkat = UnsupportedSyscall(x86=303, x64=265)
-symlinkat = UnsupportedSyscall(x86=304, x64=266)
+renameat = EmulatedSyscall(x86=302, x64=264)
+linkat = EmulatedSyscall(x86=303, x64=265)
+symlinkat = EmulatedSyscall(x86=304, x64=266)
 readlinkat = IrregularEmulatedSyscall(x86=305, x64=267)
-fchmodat = UnsupportedSyscall(x86=306, x64=268)
+fchmodat = EmulatedSyscall(x86=306, x64=268)
 
 #  int faccessat(int dirfd, const char *pathname, int mode, int flags)
 #
@@ -1433,7 +1440,7 @@ pselect6 = IrregularEmulatedSyscall(x86=308, x64=270)
 
 ppoll = IrregularEmulatedSyscall(x86=309, x64=271)
 
-unshare = IrregularEmulatedSyscall(x86=310, x64=272)
+unshare = EmulatedSyscall(x86=310, x64=272)
 
 #  long set_robust_list(struct robust_list_head *head, size_t len)
 #
@@ -1470,7 +1477,7 @@ sync_file_range = UnsupportedSyscall(x86=314, x64=277)
 tee = UnsupportedSyscall(x86=315, x64=276)
 vmsplice = UnsupportedSyscall(x86=316, x64=278)
 move_pages = UnsupportedSyscall(x86=317, x64=279)
-getcpu = UnsupportedSyscall(x86=318, x64=309)
+getcpu = EmulatedSyscall(x86=318, x64=309, arg1="unsigned int", arg2="unsigned int")
 epoll_pwait = UnsupportedSyscall(x86=319, x64=281)
 
 #  int utimensat(int dirfd, const char *pathname, const struct timespec
@@ -1496,7 +1503,7 @@ signalfd = EmulatedSyscall(x86=321, x64=282)
 # descriptor that refers to that timer.
 timerfd_create = EmulatedSyscall(x86=322, x64=283)
 
-eventfd = UnsupportedSyscall(x86=323, x64=284)
+eventfd = EmulatedSyscall(x86=323, x64=284)
 
 # int fallocate(int fd, int mode, off_t offset, off_t len);
 #
@@ -1578,7 +1585,7 @@ rt_tgsigqueueinfo = EmulatedSyscall(x86=335, x64=297)
 # Given a list of parameters, perf_event_open() returns a file
 # descriptor, for use in subsequent system calls (read(2), mmap(2),
 # prctl(2), fcntl(2), etc.).
-perf_event_open = EmulatedSyscall(x86=336, x64=298)
+perf_event_open = IrregularEmulatedSyscall(x86=336, x64=298)
 
 #  int recvmmsg(int sockfd, struct mmsghdr *msgvec,
 #               unsigned int vlen, unsigned int flags,
@@ -1591,8 +1598,8 @@ perf_event_open = EmulatedSyscall(x86=336, x64=298)
 # a timeout on the receive operation.
 recvmmsg = IrregularEmulatedSyscall(x86=337, x64=299)
 
-fanotify_init = UnsupportedSyscall(x86=338, x64=300)
-fanotify_mark = UnsupportedSyscall(x86=339, x64=301)
+fanotify_init = EmulatedSyscall(x86=338, x64=300)
+fanotify_mark = EmulatedSyscall(x86=339, x64=301)
 
 #  int prlimit(pid_t pid, int resource, const struct rlimit *new_limit, struct
 #rlimit *old_limit);
@@ -1607,8 +1614,8 @@ fanotify_mark = UnsupportedSyscall(x86=339, x64=301)
 # during replay.
 prlimit64 = EmulatedSyscall(x86=340, x64=302, arg4="typename Arch::rlimit64")
 
-name_to_handle_at = UnsupportedSyscall(x86=341, x64=303)
-open_by_handle_at = UnsupportedSyscall(x86=342, x64=304)
+name_to_handle_at = IrregularEmulatedSyscall(x86=341, x64=303)
+open_by_handle_at = EmulatedSyscall(x86=342, x64=304)
 clock_adjtime = UnsupportedSyscall(x86=343, x64=305)
 syncfs = EmulatedSyscall(x86=344, x64=306)
 
@@ -1621,17 +1628,26 @@ syncfs = EmulatedSyscall(x86=344, x64=306)
 # applications.)
 sendmmsg = IrregularEmulatedSyscall(x86=345, x64=307)
 
-setns = UnsupportedSyscall(x86=346, x64=308)
-process_vm_readv = UnsupportedSyscall(x86=347, x64=310)
-process_vm_writev = UnsupportedSyscall(x86=348, x64=311)
-kcmp = UnsupportedSyscall(x86=349, x64=312)
+setns = EmulatedSyscall(x86=346, x64=308)
+process_vm_readv = IrregularEmulatedSyscall(x86=347, x64=310)
+process_vm_writev = IrregularEmulatedSyscall(x86=348, x64=311)
+kcmp = EmulatedSyscall(x86=349, x64=312)
 finit_module = UnsupportedSyscall(x86=350, x64=313)
 sched_setattr = UnsupportedSyscall(x86=351, x64=314)
 sched_getattr = UnsupportedSyscall(x86=352, x64=315)
-renameat2 = UnsupportedSyscall(x86=353, x64=316)
+renameat2 = EmulatedSyscall(x86=353, x64=316)
 seccomp = IrregularEmulatedSyscall(x86=354, x64=317)
 getrandom = IrregularEmulatedSyscall(x86=355, x64=318)
 memfd_create = EmulatedSyscall(x86=356, x64=319)
+
+bpf = UnsupportedSyscall(x86=357, x64=321)
+execveat = UnsupportedSyscall(x86=358, x64=322)
+userfaultfd = UnsupportedSyscall(x86=374, x64=323)
+membarrier = EmulatedSyscall(x86=375, x64=324)
+mlock2 = UnsupportedSyscall(x86=376, x64=325)
+copy_file_range = UnsupportedSyscall(x86=377, x64=326)
+preadv2 = UnsupportedSyscall(x86=378, x64=327)
+pwritev2 = UnsupportedSyscall(x86=379, x64=328)
 
 # restart_syscall is a little special.
 restart_syscall = RestartSyscall(x86=0, x64=219)
@@ -1639,24 +1655,27 @@ restart_syscall = RestartSyscall(x86=0, x64=219)
 rrcall_init_preload = IrregularEmulatedSyscall(x86=442, x64=442)
 rrcall_init_buffers = IrregularEmulatedSyscall(x86=443, x64=443)
 rrcall_notify_syscall_hook_exit = IrregularEmulatedSyscall(x86=444, x64=444)
+rrcall_notify_control_msg = IrregularEmulatedSyscall(x86=445, x64=445)
+rrcall_reload_auxv = IrregularEmulatedSyscall(x86=446, x64=446)
+rrcall_mprotect_record = IrregularEmulatedSyscall(x86=447, x64=447)
 
-# These syscalls are subsumed under socketcall on x86.
-socket = EmulatedSyscall(x64=41)
-connect = EmulatedSyscall(x64=42)
+# These syscalls are also subsumed under socketcall on x86.
+socket = EmulatedSyscall(x86=359, x64=41)
+connect = EmulatedSyscall(x86=362, x64=42)
 accept = IrregularEmulatedSyscall(x64=43)
-sendto = EmulatedSyscall(x64=44)
-recvfrom = IrregularEmulatedSyscall(x64=45)
-sendmsg = IrregularEmulatedSyscall(x64=46)
-recvmsg = IrregularEmulatedSyscall(x64=47)
-shutdown = EmulatedSyscall(x64=48)
-bind = EmulatedSyscall(x64=49)
-listen = EmulatedSyscall(x64=50)
-getsockname = IrregularEmulatedSyscall(x64=51)
-getpeername = IrregularEmulatedSyscall(x64=52)
-socketpair = EmulatedSyscall(x64=53, arg4="int[2]")
-setsockopt = EmulatedSyscall(x64=54)
-getsockopt = IrregularEmulatedSyscall(x64=55)
-accept4 = IrregularEmulatedSyscall(x64=288)
+sendto = IrregularEmulatedSyscall(x86=369, x64=44)
+recvfrom = IrregularEmulatedSyscall(x86=371, x64=45)
+sendmsg = IrregularEmulatedSyscall(x86=370, x64=46)
+recvmsg = IrregularEmulatedSyscall(x86=372, x64=47)
+shutdown = EmulatedSyscall(x86=373, x64=48)
+bind = EmulatedSyscall(x86=361, x64=49)
+listen = EmulatedSyscall(x86=363, x64=50)
+getsockname = IrregularEmulatedSyscall(x86=367, x64=51)
+getpeername = IrregularEmulatedSyscall(x86=368, x64=52)
+socketpair = EmulatedSyscall(x86=360, x64=53, arg4="int[2]")
+setsockopt = IrregularEmulatedSyscall(x86=366, x64=54)
+getsockopt = IrregularEmulatedSyscall(x86=365, x64=55)
+accept4 = IrregularEmulatedSyscall(x86=364, x64=288)
 
 # These syscalls are subsumed under ipc on x86.
 shmget = EmulatedSyscall(x64=29)

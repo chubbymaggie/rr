@@ -3,10 +3,12 @@
 #include "StdioMonitor.h"
 
 #include "Flags.h"
-#include "log.h"
 #include "ReplaySession.h"
+#include "ReplayTask.h"
 #include "Session.h"
-#include "task.h"
+#include "log.h"
+
+namespace rr {
 
 Switchable StdioMonitor::will_write(Task* t) {
   if (Flags::get().mark_stdio && t->session().visible_execution()) {
@@ -21,9 +23,13 @@ Switchable StdioMonitor::will_write(Task* t) {
   return PREVENT_SWITCH;
 }
 
-void StdioMonitor::did_write(Task* t, const std::vector<Range>& ranges) {
-  if (t->session().is_replaying() && t->replay_session().redirect_stdio() &&
-      t->session().visible_execution()) {
+void StdioMonitor::did_write(Task* t, const std::vector<Range>& ranges,
+                             LazyOffset&) {
+  if (!t->session().is_replaying()) {
+    return;
+  }
+  auto rt = static_cast<ReplayTask*>(t);
+  if (rt->session().redirect_stdio() && rt->session().visible_execution()) {
     for (auto& r : ranges) {
       auto bytes = t->read_mem(r.data.cast<uint8_t>(), r.length);
       if (bytes.size() !=
@@ -33,3 +39,5 @@ void StdioMonitor::did_write(Task* t, const std::vector<Range>& ranges) {
     }
   }
 }
+
+} // namespace rr

@@ -9,23 +9,37 @@
 
 #include "AddressSpace.h"
 #include "AutoRemoteSyscalls.h"
+#include "RecordTask.h"
+#include "Registers.h"
+#include "TaskGroup.h"
 #include "kernel_abi.h"
 #include "log.h"
-#include "Registers.h"
 #include "seccomp-bpf.h"
-#include "task.h"
 
 using namespace std;
 
-static void set_syscall_result(Task* t, long ret) {
+namespace rr {
+
+static void set_syscall_result(RecordTask* t, long ret) {
   Registers r = t->regs();
   r.set_syscall_result(ret);
   t->set_regs(r);
 }
 
+static void pass_through_seccomp_filter(RecordTask* t) {
+  long ret;
+  {
+    AutoRemoteSyscalls remote(t);
+    ret = remote.syscall(t->regs().original_syscallno(), t->regs().arg1(),
+                         t->regs().arg2(), t->regs().arg3());
+  }
+  set_syscall_result(t, ret);
+  ASSERT(t, t->regs().syscall_failed());
+}
+
 template <typename Arch>
 static void install_patched_seccomp_filter_arch(
-    Task* t, unordered_map<uint32_t, uint16_t>& result_to_index,
+    RecordTask* t, unordered_map<uint32_t, uint16_t>& result_to_index,
     vector<uint32_t>& index_to_result) {
   // Take advantage of the fact that the filter program is arg3() in both
   // prctl and seccomp syscalls.
@@ -33,12 +47,15 @@ static void install_patched_seccomp_filter_arch(
   auto prog =
       t->read_mem(remote_ptr<typename Arch::sock_fprog>(t->regs().arg3()), &ok);
   if (!ok) {
-    set_syscall_result(t, -EFAULT);
+    // We'll probably return EFAULT but a kernel that doesn't support
+    // seccomp(2) should return ENOSYS instead, so just run the original
+    // system call to get the correct error.
+    pass_through_seccomp_filter(t);
     return;
   }
   auto code = t->read_mem(prog.filter.rptr(), prog.len, &ok);
   if (!ok) {
-    set_syscall_result(t, -EFAULT);
+    pass_through_seccomp_filter(t);
     return;
   }
   // Convert all returns to TRACE returns so that rr can handle them.
@@ -60,33 +77,27 @@ static void install_patched_seccomp_filter_arch(
     }
   }
 
-  uintptr_t privileged_in_untraced_syscall_ip =
-      AddressSpace::rr_page_ip_in_privileged_untraced_syscall()
-          .register_value();
-  uintptr_t privileged_in_traced_syscall_ip =
-      AddressSpace::rr_page_ip_in_privileged_traced_syscall().register_value();
-  assert(privileged_in_untraced_syscall_ip ==
-         uint32_t(privileged_in_untraced_syscall_ip));
-  assert(privileged_in_traced_syscall_ip ==
-         uint32_t(privileged_in_traced_syscall_ip));
-
-  static const typename Arch::sock_filter prefix[] = {
-    ALLOW_SYSCALLS_FROM_CALLSITE(uint32_t(privileged_in_untraced_syscall_ip)),
-    ALLOW_SYSCALLS_FROM_CALLSITE(uint32_t(privileged_in_traced_syscall_ip))
-  };
-  code.insert(code.begin(), prefix, prefix + array_length(prefix));
+  SeccompFilter<typename Arch::sock_filter> f;
+  for (auto& e : AddressSpace::rr_page_syscalls()) {
+    if (e.privileged == AddressSpace::PRIVILEGED) {
+      auto ip = AddressSpace::rr_page_syscall_exit_point(e.traced, e.privileged,
+                                                         e.enabled);
+      f.allow_syscalls_from_callsite(ip);
+    }
+  }
+  f.filters.insert(f.filters.end(), code.begin(), code.end());
 
   long ret;
   {
     AutoRemoteSyscalls remote(t);
-    AutoRestoreMem mem(remote, nullptr,
-                       sizeof(prog) +
-                           code.size() * sizeof(typename Arch::sock_filter));
+    AutoRestoreMem mem(
+        remote, nullptr,
+        sizeof(prog) + f.filters.size() * sizeof(typename Arch::sock_filter));
     auto code_ptr = mem.get().cast<typename Arch::sock_filter>();
-    t->write_mem(code_ptr, code.data(), code.size());
-    prog.len = code.size();
+    t->write_mem(code_ptr, f.filters.data(), f.filters.size());
+    prog.len = f.filters.size();
     prog.filter = code_ptr;
-    auto prog_ptr = remote_ptr<void>(code_ptr + code.size())
+    auto prog_ptr = remote_ptr<void>(code_ptr + f.filters.size())
                         .cast<typename Arch::sock_fprog>();
     t->write_mem(prog_ptr, prog);
 
@@ -94,9 +105,22 @@ static void install_patched_seccomp_filter_arch(
                          t->regs().arg2(), prog_ptr);
   }
   set_syscall_result(t, ret);
+
+  if (!t->regs().syscall_failed()) {
+    if (is_seccomp_syscall(t->regs().original_syscallno(), t->arch()) &&
+        (t->regs().arg2() & SECCOMP_FILTER_FLAG_TSYNC)) {
+      for (Task* tt : t->task_group()->task_set()) {
+        static_cast<RecordTask*>(tt)->prctl_seccomp_status = 2;
+      }
+    } else {
+      t->prctl_seccomp_status = 2;
+    }
+  }
 }
 
-void SeccompFilterRewriter::install_patched_seccomp_filter(Task* t) {
+void SeccompFilterRewriter::install_patched_seccomp_filter(RecordTask* t) {
   RR_ARCH_FUNCTION(install_patched_seccomp_filter_arch, t->arch(), t,
                    result_to_index, index_to_result);
 }
+
+} // namespace rr

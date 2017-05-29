@@ -15,9 +15,11 @@ static void* start_thread(__attribute__((unused)) void* p) {
   sigaddset(&s, SIGSEGV);
   sigprocmask(SIG_BLOCK, &s, NULL);
 
+  rdtsc();
+
   atomic_puts("EXIT-SUCCESS");
 
-  *(int*)NULL = 0;
+  crash_null_deref();
 
   return NULL;
 }

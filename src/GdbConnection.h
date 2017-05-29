@@ -16,6 +16,8 @@
 #include "ReplaySession.h"
 #include "ReplayTimeline.h"
 
+namespace rr {
+
 /**
  * Descriptor for task within a task group.  Note: on linux, we can
  * uniquely identify any thread by its |tid| (ignoring pid
@@ -58,18 +60,6 @@ struct GdbRegisterValue {
   bool defined;
 };
 
-/**
- * Represents the register file, indexed by |DbgRegister| values
- * above.
- */
-struct GdbRegisterFile {
-  std::vector<GdbRegisterValue> regs;
-
-  GdbRegisterFile(size_t n_regs) : regs(n_regs){};
-
-  size_t total_registers() const { return regs.size(); }
-};
-
 enum GdbRequestType {
   DREQ_NONE = 0,
 
@@ -88,6 +78,8 @@ enum GdbRequestType {
   DREQ_GET_THREAD_EXTRA_INFO,
   DREQ_SET_CONTINUE_THREAD,
   DREQ_SET_QUERY_THREAD,
+  // TLS lookup, uses params.target and params.tls.
+  DREQ_TLS,
   // gdb wants to write back siginfo_t to a tracee.  More
   // importantly, this packet arrives before an experiment
   // session for a |call foo()| is about to be torn down.
@@ -137,6 +129,9 @@ enum GdbRequestType {
 
   /* Uses params.text. */
   DREQ_RR_CMD,
+
+  // qSymbol packet, uses params.sym.
+  DREQ_QSYMBOL,
 };
 
 enum GdbRestartType {
@@ -173,7 +168,9 @@ struct GdbRequest {
         reg_(other.reg_),
         restart_(other.restart_),
         cont_(other.cont_),
-        text_(other.text_) {}
+        text_(other.text_),
+        tls_(other.tls_),
+        sym_(other.sym_) {}
   GdbRequest& operator=(const GdbRequest& other) {
     this->~GdbRequest();
     new (this) GdbRequest(other);
@@ -194,7 +191,7 @@ struct GdbRequest {
   struct Watch {
     uintptr_t addr;
     int kind;
-    std::vector<std::vector<uint8_t> > conditions;
+    std::vector<std::vector<uint8_t>> conditions;
   } watch_;
   GdbRegisterValue reg_;
   struct Restart {
@@ -207,6 +204,15 @@ struct GdbRequest {
     std::vector<GdbContAction> actions;
   } cont_;
   std::string text_;
+  struct Tls {
+    size_t offset;
+    remote_ptr<void> load_module;
+  } tls_;
+  struct Symbol {
+    bool has_address;
+    remote_ptr<void> address;
+    std::string name;
+  } sym_;
 
   Mem& mem() {
     assert(type >= DREQ_MEM_FIRST && type <= DREQ_MEM_LAST);
@@ -252,6 +258,22 @@ struct GdbRequest {
     assert(type == DREQ_RR_CMD);
     return text_;
   }
+  Tls& tls() {
+    assert(type == DREQ_TLS);
+    return tls_;
+  }
+  const Tls& tls() const {
+    assert(type == DREQ_TLS);
+    return tls_;
+  }
+  Symbol& sym() {
+    assert(type == DREQ_QSYMBOL);
+    return sym_;
+  }
+  const Symbol& sym() const {
+    assert(type == DREQ_QSYMBOL);
+    return sym_;
+  }
 
   /**
    * Return nonzero if this requires that program execution be resumed
@@ -266,44 +288,10 @@ struct GdbRequest {
  */
 class GdbConnection {
 public:
-  /**
-   * Wait for exactly one gdb host to connect to this remote target on
-   * IP address 127.0.0.1, port |port|.  If |probe| is nonzero, a unique
-   * port based on |start_port| will be searched for.  Otherwise, if
-   * |port| is already bound, this function will fail.
-   *
-   * Pass the |tgid| of the task on which this debug-connection request
-   * is being made.  The remaining debugging session will be limited to
-   * traffic regarding |tgid|, but clients don't need to and shouldn't
-   * need to assume that.
-   *
-   * If we're opening this connection on behalf of a known client, pass
-   * an fd in |client_params_fd|; we'll write the allocated port and |exe_image|
-   * through the fd before waiting for a connection. |exe_image| is the
-   * process that will be debugged by client, or null ptr if there isn't
-   * a client.
-   *
-   * This function is infallible: either it will return a valid
-   * debugging context, or it won't return.
-   */
-  enum ProbePort { DONT_PROBE = 0, PROBE_PORT };
   struct Features {
     Features() : reverse_execution(true) {}
     bool reverse_execution;
   };
-  static std::unique_ptr<GdbConnection> await_client_connection(
-      unsigned short desired_port, ProbePort probe, pid_t tgid,
-      const std::string& exe_image, const Features& features,
-      ScopedFd* client_params_fd = nullptr);
-
-  /**
-   * Exec gdb using the params that were written to
-   * |params_pipe_fd|.  Optionally, pre-define in the gdb client the set
-   * of macros defined in |macros| if nonnull.
-   */
-  static void launch_gdb(ScopedFd& params_pipe_fd, const std::string& macros,
-                         const std::string& gdb_command_file_path,
-                         const std::string& gdb_binary_file_path);
 
   /**
    * Call this when the target of |req| is needed to fulfill the
@@ -412,7 +400,7 @@ public:
    * Send |file| back to the debugger host.  |file| may contain
    * undefined register values.
    */
-  void reply_get_regs(const GdbRegisterFile& file);
+  void reply_get_regs(const std::vector<GdbRegisterValue>& file);
 
   /**
    * Pass |ok = true| iff the requested register was successfully set.
@@ -463,6 +451,23 @@ public:
   void reply_rr_cmd(const std::string& text);
 
   /**
+   * Send a qSymbol response to gdb, requesting the address of the
+   * symbol |name|.
+   */
+  void send_qsymbol(const std::string& name);
+
+  /**
+   * The "all done" response to a qSymbol packet from gdb.
+   */
+  void qsymbols_finished();
+
+  /**
+   * Respond to a qGetTLSAddr packet.  If |ok| is true, then respond
+   * with |address|.  If |ok| is false, respond with an error.
+   */
+  void reply_tls_addr(bool ok, remote_ptr<void> address);
+
+  /**
    * Create a checkpoint of the given Session with the given id. Delete the
    * existing checkpoint with that id if there is one.
    */
@@ -488,7 +493,13 @@ public:
 
   const Features& features() { return features_; }
 
-private:
+  enum {
+    CPU_64BIT = 0x1,
+    CPU_AVX = 0x2,
+  };
+  void set_cpu_features(uint32_t features) { cpu_features_ = features; }
+  uint32_t cpu_features() const { return cpu_features_; }
+
   GdbConnection(pid_t tgid, const Features& features);
 
   /**
@@ -497,6 +508,12 @@ private:
    */
   void await_debugger(ScopedFd& listen_fd);
 
+  /**
+   *  Returns false if the connection has been closed
+  */
+  bool is_connection_alive();
+
+private:
   /**
    * read() incoming data exactly one time, successfully.  May block.
    */
@@ -511,7 +528,11 @@ private:
   void write_packet(const char* data);
   void write_binary_packet(const char* pfx, const uint8_t* data,
                            ssize_t num_bytes);
+  void write_hex_bytes_packet(const char* prefix, const uint8_t* bytes,
+                              size_t len);
   void write_hex_bytes_packet(const uint8_t* bytes, size_t len);
+  void write_xfer_response(const void* data, size_t size, uint64_t offset,
+                           uint64_t len);
   /**
    * Consume bytes in the input buffer until start-of-packet ('$') or
    * the interrupt character is seen.  Does not block.  Return true if
@@ -571,17 +592,18 @@ private:
   // multi-exe-image debugging scenarios, so we pretend only
   // this task group exists when interfacing with gdb
   pid_t tgid;
+  uint32_t cpu_features_;
   // true when "no-ack mode" enabled, in which we don't have
   // to send ack packets back to gdb.  This is a huge perf win.
   bool no_ack;
   ScopedFd sock_fd;
-  /* XXX probably need to dynamically size these */
-  uint8_t inbuf[32768];  /* buffered input from gdb */
-  ssize_t inlen;         /* length of valid data */
-  ssize_t packetend;     /* index of '#' character */
-  uint8_t outbuf[32768]; /* buffered output for gdb */
-  ssize_t outlen;
+  std::vector<uint8_t> inbuf;  /* buffered input from gdb */
+  size_t packetend;            /* index of '#' character */
+  std::vector<uint8_t> outbuf; /* buffered output for gdb */
   Features features_;
+  bool connection_alive_;
 };
+
+} // namespace rr
 
 #endif /* RR_GDB_CONNECTION_H_ */

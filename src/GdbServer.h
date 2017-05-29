@@ -14,6 +14,8 @@
 #include "ScopedFd.h"
 #include "TraceFrame.h"
 
+namespace rr {
+
 class GdbServer {
   // Not ideal but we can't inherit friend from GdbCommand
   friend std::string invoke_checkpoint(GdbServer&, Task*,
@@ -36,14 +38,22 @@ public:
 
   struct ConnectionFlags {
     // -1 to let GdbServer choose the port, a positive integer to select a
-    // specific port to listen on.
+    // specific port to listen on. If keep_listening is on, wait for another
+    // debugger connection after the first one is terminated.
     int dbg_port;
+    bool keep_listening;
     // If non-null, then when the gdbserver is set up, we write its connection
     // parameters through this pipe. GdbServer::launch_gdb is passed the
     // other end of this pipe to exec gdb with the parameters.
     ScopedFd* debugger_params_write_pipe;
+    // Name of the debugger to suggest. Only used if debugger_params_write_pipe
+    // is null.
+    std::string debugger_name;
 
-    ConnectionFlags() : dbg_port(-1), debugger_params_write_pipe(nullptr) {}
+    ConnectionFlags()
+        : dbg_port(-1),
+          keep_listening(false),
+          debugger_params_write_pipe(nullptr) {}
   };
 
   /**
@@ -53,12 +63,13 @@ public:
             const ReplaySession::Flags& flags, const Target& target)
       : target(target),
         final_event(UINT32_MAX),
-        stop_reason(0),
         in_debuggee_end_state(false),
         stop_replaying_to_target(false),
         interrupt_pending(false),
         timeline(std::move(session), flags),
-        emergency_debug_session(nullptr) {}
+        emergency_debug_session(nullptr) {
+    memset(&stop_siginfo, 0, sizeof(stop_siginfo));
+  }
 
   /**
    * Actually run the server. Returns only when the debugger disconnects.
@@ -70,8 +81,8 @@ public:
    * the pipe passed to serve_replay_with_debugger).
    */
   static void launch_gdb(ScopedFd& params_pipe_fd,
-                         const std::string& gdb_command_file_path,
-                         const std::string& gdb_binary_file_path);
+                         const std::string& gdb_binary_file_path,
+                         const std::vector<std::string>& gdb_options);
 
   /**
    * Start a debugging connection for |t| and return when there are no
@@ -102,17 +113,10 @@ public:
                                   const ExtraRegisters& extra_regs,
                                   GdbRegister which);
 
+  ReplayTimeline& get_timeline() { return timeline; }
+
 private:
-  GdbServer(std::unique_ptr<GdbConnection>& dbg, Task* t)
-      : dbg(std::move(dbg)),
-        debuggee_tguid(t->task_group()->tguid()),
-        last_continue_tuid(t->tuid()),
-        last_query_tuid(t->tuid()),
-        final_event(UINT32_MAX),
-        stop_reason(0),
-        stop_replaying_to_target(false),
-        interrupt_pending(false),
-        emergency_debug_session(&t->session()) {}
+  GdbServer(std::unique_ptr<GdbConnection>& dbg, Task* t);
 
   Session& current_session() {
     return timeline.is_running() ? timeline.current_session()
@@ -122,9 +126,10 @@ private:
   void dispatch_regs_request(const Registers& regs,
                              const ExtraRegisters& extra_regs);
   enum ReportState { REPORT_NORMAL, REPORT_THREADS_DEAD };
+  void maybe_intercept_mem_request(Task* target, const GdbRequest& req,
+                                   std::vector<uint8_t>* result);
   /**
-   * Process the single debugger request |req|, made by |dbg| targeting
-   * |t|, inside the session |session|.
+   * Process the single debugger request |req| inside the session |session|.
    *
    * Callers should implement any special semantics they want for
    * particular debugger requests before calling this helper, to do
@@ -206,8 +211,8 @@ private:
   // The TaskUid of the last queried task.
   TaskUid last_query_tuid;
   TraceFrame::Time final_event;
-  // Stop reason for last notified stop.
-  int stop_reason;
+  // siginfo for last notified stop.
+  siginfo_t stop_siginfo;
   bool in_debuggee_end_state;
   // True when the user has interrupted replaying to a target event.
   volatile bool stop_replaying_to_target;
@@ -241,6 +246,13 @@ private:
 
   // gdb checkpoints, indexed by ID
   std::map<int, Checkpoint> checkpoints;
+
+  // Set of symbols to look up, for qSymbol.
+  std::set<std::string> symbols;
+  // Iterator into |symbols|.
+  std::set<std::string>::iterator symbols_iter;
 };
+
+} // namespace rr
 
 #endif /* RR_GDB_SERVER_H_ */

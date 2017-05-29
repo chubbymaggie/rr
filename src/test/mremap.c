@@ -2,8 +2,6 @@
 
 #include "rrutil.h"
 
-#define DUMMY_FILE "dummy.txt"
-
 static void check_mapping(int* rpage, int* wpage, ssize_t nr_ints) {
   int i;
   for (i = 0; i < nr_ints; ++i) {
@@ -19,6 +17,7 @@ static void check_mapping(int* rpage, int* wpage, ssize_t nr_ints) {
 static void overwrite_file(const char* path, ssize_t num_bytes) {
   const int magic = 0x5a5a5a5a;
   int fd = open(path, O_TRUNC | O_RDWR, 0600);
+  test_assert(fd >= 0);
   size_t i;
   for (i = 0; i < num_bytes / sizeof(magic); ++i) {
     write(fd, &magic, sizeof(magic));
@@ -26,10 +25,11 @@ static void overwrite_file(const char* path, ssize_t num_bytes) {
   close(fd);
 }
 
+static const char file_name[] = "tmpfile";
+
 int main(void) {
   size_t num_bytes = sysconf(_SC_PAGESIZE);
-  char file_name[] = "/tmp/rr-test-mremap-XXXXXX";
-  int fd = mkstemp(file_name);
+  int fd = open(file_name, O_CREAT | O_EXCL | O_RDWR, 0600);
   int* wpage;
   int* rpage;
   int* old_wpage;
@@ -48,13 +48,22 @@ int main(void) {
   overwrite_file(file_name, 2 * num_bytes);
 
   old_wpage = wpage;
-  wpage = mremap(old_wpage, num_bytes, 2 * num_bytes, MREMAP_MAYMOVE);
+
+  /* Test invalid mremap */
+  test_assert(MAP_FAILED ==
+              mremap(old_wpage, num_bytes, 2 * num_bytes - 1, 0xFFFFFFFF));
+  test_assert(EINVAL == errno);
+
+  /* Test remapping a non-page-sized range */
+  wpage = mremap(old_wpage, num_bytes, 2 * num_bytes - 1, MREMAP_MAYMOVE);
   atomic_printf("remapped wpage:%p\n", wpage);
   test_assert(wpage != (void*)-1 && wpage != old_wpage);
 
   check_mapping(rpage, wpage, num_bytes / sizeof(*wpage));
 
   atomic_puts("EXIT-SUCCESS");
+
+  unlink(file_name);
 
   return 0;
 }

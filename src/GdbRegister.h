@@ -3,6 +3,8 @@
 #ifndef RR_GDB_REGISTER_H_
 #define RR_GDB_REGISTER_H_
 
+namespace rr {
+
 /**
  * This is the register numbering used by GDB.
  */
@@ -53,7 +55,6 @@ enum GdbRegister {
   // XXX the last fxsave reg on *x86*
   DREG_LAST_FXSAVE_REG = DREG_MXCSR,
   DREG_ORIG_EAX,
-  DREG_NUM_LINUX_I386,
   DREG_YMM0H,
   DREG_YMM1H,
   DREG_YMM2H,
@@ -62,6 +63,7 @@ enum GdbRegister {
   DREG_YMM5H,
   DREG_YMM6H,
   DREG_YMM7H,
+  DREG_NUM_LINUX_I386,
   // Last register we can find in user_regs_struct
   // (except for orig_eax).
   DREG_NUM_USER_REGS = DREG_GS + 1,
@@ -132,7 +134,8 @@ enum GdbRegister {
   DREG_64_MXCSR,
   DREG_64_LAST_FXSAVE_REG = DREG_64_MXCSR,
   DREG_ORIG_RAX,
-  DREG_NUM_LINUX_X86_64,
+  DREG_FS_BASE,
+  DREG_GS_BASE,
   DREG_64_YMM0H,
   DREG_64_YMM1H,
   DREG_64_YMM2H,
@@ -149,8 +152,11 @@ enum GdbRegister {
   DREG_64_YMM13H,
   DREG_64_YMM14H,
   DREG_64_YMM15H,
+  DREG_NUM_LINUX_X86_64,
   // Last register we can find in user_regs_struct (except for orig_rax).
   DREG_64_NUM_USER_REGS = DREG_64_GS + 1,
 };
+
+} // namespace rr
 
 #endif /* RR_GDB_REGISTER_H_ */

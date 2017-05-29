@@ -1,10 +1,9 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "GdbServer"
-
 #include "GdbServer.h"
 
 #include <assert.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/wait.h>
@@ -12,22 +11,37 @@
 
 #include <limits>
 #include <map>
-#include <string>
 #include <sstream>
+#include <string>
 #include <vector>
 
 #include "BreakpointCondition.h"
 #include "GdbCommandHandler.h"
 #include "GdbExpression.h"
-#include "kernel_metadata.h"
-#include "log.h"
 #include "ReplaySession.h"
 #include "ScopedFd.h"
-#include "task.h"
+#include "StringVectorToCharArray.h"
+#include "Task.h"
+#include "TaskGroup.h"
+#include "kernel_metadata.h"
+#include "log.h"
 #include "util.h"
 
-using namespace rr;
 using namespace std;
+
+namespace rr {
+
+GdbServer::GdbServer(std::unique_ptr<GdbConnection>& dbg, Task* t)
+    : dbg(std::move(dbg)),
+      debuggee_tguid(t->task_group()->tguid()),
+      last_continue_tuid(t->tuid()),
+      last_query_tuid(t->tuid()),
+      final_event(UINT32_MAX),
+      stop_replaying_to_target(false),
+      interrupt_pending(false),
+      emergency_debug_session(&t->session()) {
+  memset(&stop_siginfo, 0, sizeof(stop_siginfo));
+}
 
 // Special-sauce macros defined by rr when launching the gdb client,
 // which implement functionality outside of the gdb remote protocol.
@@ -88,12 +102,30 @@ static const string& gdb_rr_macros() {
        << "define hookpost-run\n"
        << "  set $suppress_run_hook = 0\n"
        << "end\n"
+       << "set unwindonsignal on\n"
        << "handle SIGURG stop\n"
-       << "set prompt (rr) \n" << GdbCommandHandler::gdb_macros()
+       << "set prompt (rr) \n"
+       << GdbCommandHandler::gdb_macros()
        // Try both "set target-async" and "maint set target-async" since
        // that changed recently.
-       << "set target-async 0\n"
-       << "maint set target-async 0\n";
+       << "python\n"
+       << "import re\n"
+       << "m = re.compile("
+       << "'.* ([0-9]+)\\.([0-9]+)(\\.([0-9]+))?.*'"
+       << ").match(gdb.execute('show version', False, True))\n"
+       << "ver = int(m.group(1))*10000 + int(m.group(2))*100\n"
+       << "if m.group(4):\n"
+       << "    ver = ver + int(m.group(4))\n"
+       << "\n"
+       << "if ver == 71100:\n"
+       << "    gdb.write("
+       << "'This version of gdb (7.11.0) has known bugs that break rr. "
+       << "Install 7.11.1 or later.\\n', gdb.STDERR)\n"
+       << "\n"
+       << "if ver < 71101:\n"
+       << "    gdb.execute('set target-async 0')\n"
+       << "    gdb.execute('maint set target-async 0')\n"
+       << "end\n";
     s = ss.str();
   }
   return s;
@@ -130,7 +162,7 @@ GdbRegisterValue GdbServer::get_reg(const Registers& regs,
   GdbRegisterValue reg;
   memset(&reg, 0, sizeof(reg));
   reg.name = which;
-  reg.size = ::get_reg(regs, extra_regs, &reg.value[0], which, &reg.defined);
+  reg.size = rr::get_reg(regs, extra_regs, &reg.value[0], which, &reg.defined);
   return reg;
 }
 
@@ -174,36 +206,54 @@ static WatchType watchpoint_type(GdbRequestType req) {
 }
 
 static void maybe_singlestep_for_event(Task* t, GdbRequest* req) {
+  if (!t->session().is_replaying()) {
+    return;
+  }
+  auto rt = static_cast<ReplayTask*>(t);
   if (trace_instructions_up_to_event(
-          t->replay_session().current_trace_frame().time())) {
+          rt->session().current_trace_frame().time())) {
     fputs("Stepping: ", stderr);
     t->regs().print_register_file_compact(stderr);
     fprintf(stderr, " ticks:%" PRId64 "\n", t->tick_count());
     *req = GdbRequest(DREQ_CONT);
     req->suppress_debugger_stop = true;
-    req->cont().actions.push_back(GdbContAction(
-        ACTION_STEP, get_threadid(t->replay_session(), t->tuid())));
+    req->cont().actions.push_back(
+        GdbContAction(ACTION_STEP, get_threadid(t->session(), t->tuid())));
   }
 }
 
 void GdbServer::dispatch_regs_request(const Registers& regs,
                                       const ExtraRegisters& extra_regs) {
-  size_t n_regs = regs.total_registers();
-  GdbRegisterFile file(n_regs);
-  for (size_t i = 0; i < n_regs; ++i) {
-    file.regs[i] = get_reg(regs, extra_regs, GdbRegister(i));
+  GdbRegister end;
+  // Send values for all the registers we sent XML register descriptions for.
+  // Those descriptions are controlled by GdbConnection::cpu_features().
+  bool have_AVX = dbg->cpu_features() & GdbConnection::CPU_AVX;
+  switch (regs.arch()) {
+    case x86:
+      end = have_AVX ? DREG_YMM7H : DREG_ORIG_EAX;
+      break;
+    case x86_64:
+      end = have_AVX ? DREG_64_YMM15H : DREG_ORIG_RAX;
+      break;
+    default:
+      FATAL() << "Unknown architecture";
+      return;
   }
-  dbg->reply_get_regs(file);
+  vector<GdbRegisterValue> rs;
+  for (GdbRegister r = GdbRegister(0); r < end; r = GdbRegister(r + 1)) {
+    rs.push_back(get_reg(regs, extra_regs, r));
+  }
+  dbg->reply_get_regs(rs);
 }
 
 class GdbBreakpointCondition : public BreakpointCondition {
 public:
-  GdbBreakpointCondition(const vector<vector<uint8_t> >& bytecodes) {
+  GdbBreakpointCondition(const vector<vector<uint8_t>>& bytecodes) {
     for (auto& b : bytecodes) {
       expressions.push_back(GdbExpression(b.data(), b.size()));
     }
   }
-  virtual bool evaluate(Task* t) const {
+  virtual bool evaluate(Task* t) const override {
     for (auto& e : expressions) {
       GdbExpression::Value v;
       // Break if evaluation fails or the result is nonzero
@@ -258,6 +308,39 @@ static bool search_memory(Task* t, const MemoryRange& where,
   return false;
 }
 
+template <typename Arch> static size_t word_size_arch() {
+  return sizeof(typename Arch::signed_long);
+}
+
+static size_t word_size(SupportedArch arch) {
+  RR_ARCH_FUNCTION(word_size_arch, arch);
+}
+
+static bool is_in_patch_stubs(Task* t, remote_code_ptr ip) {
+  auto p = ip.to_data_ptr<void>();
+  return t->vm()->has_mapping(p) &&
+         (t->vm()->mapping_flags_of(p) & AddressSpace::Mapping::IS_PATCH_STUBS);
+}
+
+void GdbServer::maybe_intercept_mem_request(Task* target, const GdbRequest& req,
+                                            vector<uint8_t>* result) {
+  /* Crazy hack!
+   * When gdb tries to read the word at the top of the stack, and we're in our
+   * dynamically-generated stub code, tell it the value is zero, so that gdb's
+   * stack-walking code doesn't find a bogus value that it treats as a return
+   * address and sets a breakpoint there, potentially corrupting program data.
+   * gdb sometimes reads a whole block of memory around the stack pointer so
+   * handle cases where the top-of-stack word is contained in a larger range.
+   */
+  size_t size = word_size(target->arch());
+  if (target->regs().sp().as_int() >= req.mem_.addr &&
+      target->regs().sp().as_int() + size <= req.mem_.addr + req.mem_.len &&
+      is_in_patch_stubs(target, target->ip())) {
+    memset(result->data() + target->regs().sp().as_int() - req.mem_.addr, 0,
+           size);
+  }
+}
+
 void GdbServer::dispatch_debugger_request(Session& session,
                                           const GdbRequest& req,
                                           ReportState state) {
@@ -291,7 +374,7 @@ void GdbServer::dispatch_debugger_request(Session& session,
           << "Replay interrupts should be handled at a higher level";
       assert(!t || t->task_group()->tguid() == debuggee_tguid);
       dbg->notify_stop(t ? get_threadid(t) : GdbThreadId(), 0);
-      stop_reason = 0;
+      memset(&stop_siginfo, 0, sizeof(stop_siginfo));
       if (t) {
         last_query_tuid = last_continue_tuid = t->tuid();
       }
@@ -354,6 +437,7 @@ void GdbServer::dispatch_debugger_request(Session& session,
       mem.resize(max(ssize_t(0), nread));
       target->vm()->replace_breakpoints_with_original_values(
           mem.data(), mem.size(), req.mem().addr);
+      maybe_intercept_mem_request(target, req, &mem);
       dbg->reply_get_mem(mem);
       return;
     }
@@ -426,7 +510,7 @@ void GdbServer::dispatch_debugger_request(Session& session,
     }
     case DREQ_GET_STOP_REASON: {
       dbg->reply_get_stop_reason(get_threadid(session, last_continue_tuid),
-                                 stop_reason);
+                                 stop_siginfo.si_signo);
       return;
     }
     case DREQ_SET_SW_BREAK: {
@@ -434,12 +518,13 @@ void GdbServer::dispatch_debugger_request(Session& session,
           << "Debugger setting bad breakpoint insn";
       // Mirror all breakpoint/watchpoint sets/unsets to the target process
       // if it's not part of the timeline (i.e. it's a diversion).
-      Task* replay_task = timeline.current_session().find_task(target->tuid());
+      ReplayTask* replay_task =
+          timeline.current_session().find_task(target->tuid());
       bool ok = timeline.add_breakpoint(replay_task, req.watch().addr,
                                         breakpoint_condition(req));
       if (ok && &session != &timeline.current_session()) {
         bool diversion_ok =
-            target->vm()->add_breakpoint(req.watch().addr, TRAP_BKPT_USER);
+            target->vm()->add_breakpoint(req.watch().addr, BKPT_USER);
         ASSERT(target, diversion_ok);
       }
       dbg->reply_watchpoint_request(ok);
@@ -449,7 +534,8 @@ void GdbServer::dispatch_debugger_request(Session& session,
     case DREQ_SET_RD_WATCH:
     case DREQ_SET_WR_WATCH:
     case DREQ_SET_RDWR_WATCH: {
-      Task* replay_task = timeline.current_session().find_task(target->tuid());
+      ReplayTask* replay_task =
+          timeline.current_session().find_task(target->tuid());
       bool ok = timeline.add_watchpoint(
           replay_task, req.watch().addr, req.watch().kind,
           watchpoint_type(req.type), breakpoint_condition(req));
@@ -462,10 +548,11 @@ void GdbServer::dispatch_debugger_request(Session& session,
       return;
     }
     case DREQ_REMOVE_SW_BREAK: {
-      Task* replay_task = timeline.current_session().find_task(target->tuid());
+      ReplayTask* replay_task =
+          timeline.current_session().find_task(target->tuid());
       timeline.remove_breakpoint(replay_task, req.watch().addr);
       if (&session != &timeline.current_session()) {
-        target->vm()->remove_breakpoint(req.watch().addr, TRAP_BKPT_USER);
+        target->vm()->remove_breakpoint(req.watch().addr, BKPT_USER);
       }
       dbg->reply_watchpoint_request(true);
       return;
@@ -474,7 +561,8 @@ void GdbServer::dispatch_debugger_request(Session& session,
     case DREQ_REMOVE_RD_WATCH:
     case DREQ_REMOVE_WR_WATCH:
     case DREQ_REMOVE_RDWR_WATCH: {
-      Task* replay_task = timeline.current_session().find_task(target->tuid());
+      ReplayTask* replay_task =
+          timeline.current_session().find_task(target->tuid());
       timeline.remove_watchpoint(replay_task, req.watch().addr,
                                  req.watch().kind, watchpoint_type(req.type));
       if (&session != &timeline.current_session()) {
@@ -484,10 +572,15 @@ void GdbServer::dispatch_debugger_request(Session& session,
       dbg->reply_watchpoint_request(true);
       return;
     }
-    case DREQ_READ_SIGINFO:
-      LOG(warn) << "READ_SIGINFO request outside of diversion session";
-      dbg->reply_read_siginfo(vector<uint8_t>());
+    case DREQ_READ_SIGINFO: {
+      vector<uint8_t> si_bytes;
+      si_bytes.resize(req.mem().len);
+      memset(si_bytes.data(), 0, si_bytes.size());
+      memcpy(si_bytes.data(), &stop_siginfo,
+             min(si_bytes.size(), sizeof(stop_siginfo)));
+      dbg->reply_read_siginfo(si_bytes);
       return;
+    }
     case DREQ_WRITE_SIGINFO:
       LOG(warn) << "WRITE_SIGINFO request outside of diversion session";
       dbg->reply_write_siginfo();
@@ -496,6 +589,48 @@ void GdbServer::dispatch_debugger_request(Session& session,
       dbg->reply_rr_cmd(
           GdbCommandHandler::process_command(*this, target, req.text()));
       return;
+    case DREQ_QSYMBOL: {
+      // When gdb sends "qSymbol::", it means that gdb is ready to
+      // respond to symbol requests.  This can be sent multiple times
+      // during the course of a session -- gdb sends it whenever
+      // something in the inferior has changed, making it possible
+      // that previous failed symbol lookups could now succeed.  In
+      // response to a qSymbol request from gdb, we either send back a
+      // qSymbol response, requesting the address of a symbol; or we
+      // send back OK.  We have to do this as an ordinary response and
+      // maintain our own state explicitly, as opposed to simply
+      // reading another packet from gdb, because when gdb looks up a
+      // symbol it might send other requests that must be served.  So,
+      // we keep a copy of the symbol names, and an iterator into this
+      // copy.  When gdb sends a plain "qSymbol::" packet, because gdb
+      // has detected some change in the inferior state that might
+      // enable more symbol lookups, we restart the iterator.
+      const string& name = req.sym().name;
+      if (req.sym().has_address) {
+        // Got a response holding a previously-requested symbol's name
+        // and address.
+        target->register_symbol(name, req.sym().address);
+      } else if (name == "") {
+        // Plain "qSymbol::" request.
+        symbols = target->get_symbols_and_clear_map();
+        symbols_iter = symbols.begin();
+      }
+
+      if (symbols_iter == symbols.end()) {
+        dbg->qsymbols_finished();
+      } else {
+        string symbol = *symbols_iter++;
+        dbg->send_qsymbol(symbol);
+      }
+      return;
+    }
+    case DREQ_TLS: {
+      remote_ptr<void> address;
+      bool ok = target->get_tls_address(req.tls().offset, req.tls().load_module,
+                                        &address);
+      dbg->reply_tls_addr(ok, address);
+      return;
+    }
     default:
       FATAL() << "Unknown debugger request " << req.type;
   }
@@ -548,10 +683,30 @@ bool GdbServer::diverter_process_debugger_requests(
         dbg->reply_write_siginfo();
         continue;
 
+      case DREQ_RR_CMD: {
+        assert(req->type == DREQ_RR_CMD);
+        Task* task = diversion_session.find_task(last_continue_tuid);
+        if (task) {
+          std::string reply =
+              GdbCommandHandler::process_command(*this, task, req->text());
+          // Certain commands cause the diversion to end immediately
+          // while other commands must work within a diversion.
+          if (reply == GdbCommandHandler::cmd_end_diversion()) {
+            diversion_refcount = 0;
+            return false;
+          }
+          dbg->reply_rr_cmd(reply);
+          continue;
+        } else {
+          diversion_refcount = 0;
+          return false;
+        }
+        break;
+      }
+
       default:
         break;
     }
-
     dispatch_debugger_request(diversion_session, *req, REPORT_NORMAL);
   }
 }
@@ -563,49 +718,69 @@ static bool is_last_thread_exit(const BreakStatus& break_status) {
 
 static Task* is_in_exec(ReplayTimeline& timeline) {
   Task* t = timeline.current_session().current_task();
-  return t &&
-                 timeline.current_session().next_step_is_syscall_exit(
-                     syscall_number_for_execve(t->arch()))
+  if (!t) {
+    return nullptr;
+  }
+  return timeline.current_session().next_step_is_syscall_exit(
+             syscall_number_for_execve(t->arch()))
              ? t
              : nullptr;
 }
 
 void GdbServer::maybe_notify_stop(const GdbRequest& req,
                                   const BreakStatus& break_status) {
-  int sig = -1;
+  bool do_stop = false;
   remote_ptr<void> watch_addr;
   if (!break_status.watchpoints_hit.empty()) {
-    sig = SIGTRAP;
+    do_stop = true;
+    memset(&stop_siginfo, 0, sizeof(stop_siginfo));
+    stop_siginfo.si_signo = SIGTRAP;
     watch_addr = break_status.watchpoints_hit[0].addr;
+    LOG(debug) << "Stopping for watchpoint at " << watch_addr;
   }
   if (break_status.breakpoint_hit || break_status.singlestep_complete) {
-    sig = SIGTRAP;
+    do_stop = true;
+    memset(&stop_siginfo, 0, sizeof(stop_siginfo));
+    stop_siginfo.si_signo = SIGTRAP;
+    if (break_status.breakpoint_hit) {
+      LOG(debug) << "Stopping for breakpoint";
+    } else {
+      LOG(debug) << "Stopping for singlestep";
+    }
   }
   if (break_status.signal) {
-    sig = break_status.signal;
+    do_stop = true;
+    stop_siginfo = *break_status.signal;
+    LOG(debug) << "Stopping for signal " << stop_siginfo;
   }
   if (is_last_thread_exit(break_status) && dbg->features().reverse_execution) {
+    do_stop = true;
+    memset(&stop_siginfo, 0, sizeof(stop_siginfo));
     if (req.cont().run_direction == RUN_FORWARD) {
       // The exit of the last task in a task group generates a fake SIGKILL,
       // when reverse-execution is enabled, because users often want to run
       // backwards from the end of the task.
-      sig = SIGKILL;
+      stop_siginfo.si_signo = SIGKILL;
+      LOG(debug) << "Stopping for synthetic SIGKILL";
     } else {
       // The start of the debuggee task-group should trigger a silent stop.
-      sig = 0;
+      stop_siginfo.si_signo = 0;
+      LOG(debug) << "Stopping at start of execution while running backwards";
     }
   }
   Task* t = break_status.task;
   Task* in_exec_task = is_in_exec(timeline);
   if (in_exec_task) {
-    sig = 0;
+    do_stop = true;
+    memset(&stop_siginfo, 0, sizeof(stop_siginfo));
     t = in_exec_task;
+    LOG(debug) << "Stopping at exec";
   }
-  if (sig >= 0 && t->task_group()->tguid() == debuggee_tguid) {
+  if (do_stop && t->task_group()->tguid() == debuggee_tguid) {
     /* Notify the debugger and process any new requests
      * that might have triggered before resuming. */
-    dbg->notify_stop(get_threadid(t), sig, watch_addr.as_int());
-    stop_reason = sig;
+    dbg->notify_stop(get_threadid(t), stop_siginfo.si_signo,
+                     watch_addr.as_int());
     last_query_tuid = last_continue_tuid = t->tuid();
   }
 }
@@ -692,7 +867,7 @@ GdbRequest GdbServer::divert(ReplaySession& replay) {
       // We don't support reverse execution in a diversion. Just issue
       // an immediate stop.
       dbg->notify_stop(get_threadid(*diversion_session, last_continue_tuid), 0);
-      stop_reason = 0;
+      memset(&stop_siginfo, 0, sizeof(stop_siginfo));
       last_query_tuid = last_continue_tuid;
       continue;
     }
@@ -741,18 +916,19 @@ GdbRequest GdbServer::process_debugger_requests(ReportState state) {
     try_lazy_reverse_singlesteps(req);
 
     if (req.type == DREQ_READ_SIGINFO) {
-      // TODO: we send back a dummy siginfo_t to gdb
-      // so that it thinks the request succeeded.
-      // If we don't, then it thinks the
-      // READ_SIGINFO failed and won't attempt to
-      // send WRITE_SIGINFO.  For |call foo()|
-      // frames, that means we don't know when the
-      // diversion session is ending.
       vector<uint8_t> si_bytes;
       si_bytes.resize(req.mem().len);
       memset(si_bytes.data(), 0, si_bytes.size());
+      memcpy(si_bytes.data(), &stop_siginfo,
+             min(si_bytes.size(), sizeof(stop_siginfo)));
       dbg->reply_read_siginfo(si_bytes);
 
+      // READ_SIGINFO is usually the start of a diversion. It can also be
+      // triggered by "print $_siginfo" but that is rare so we just assume it's
+      // a diversion start; if "print $_siginfo" happens we'll print the correct
+      // siginfo and then incorrectly start a diversion and go haywire :-(.
+      // Ideally we'd come up with a better way to detect diversions so that
+      // "print $_siginfo" works.
       req = divert(timeline.current_session());
       if (req.type == DREQ_NONE) {
         continue;
@@ -797,7 +973,7 @@ void GdbServer::try_lazy_reverse_singlesteps(GdbRequest& req) {
 
   ReplayTimeline::Mark now;
   bool need_seek = false;
-  Task* t = timeline.current_session().current_task();
+  ReplayTask* t = timeline.current_session().current_task();
   while (t && req.type == DREQ_CONT &&
          req.cont().run_direction == RUN_BACKWARD &&
          req.cont().actions.size() == 1 &&
@@ -882,7 +1058,9 @@ GdbServer::ContinueOrStop GdbServer::debug_one_step(
         return handle_exited_state(last_resume_request);
       }
     } else {
-      in_debuggee_end_state = false;
+      if (req.type != DREQ_DETACH) {
+        in_debuggee_end_state = false;
+      }
     }
     // Otherwise (e.g. detach, restart, interrupt or reverse-exec) process
     // the request as normal.
@@ -912,7 +1090,7 @@ GdbServer::ContinueOrStop GdbServer::debug_one_step(
     if (t->task_group()->tguid() == debuggee_tguid) {
       interrupt_pending = false;
       dbg->notify_stop(get_threadid(t), in_debuggee_end_state ? SIGKILL : 0);
-      stop_reason = 0;
+      memset(&stop_siginfo, 0, sizeof(stop_siginfo));
       return CONTINUE_DEBUGGING;
     }
   }
@@ -989,7 +1167,7 @@ GdbServer::ContinueOrStop GdbServer::debug_one_step(
 bool GdbServer::at_target() {
   // Don't launch the debugger for the initial rr fork child.
   // No one ever wants that to happen.
-  if (!timeline.current_session().can_validate()) {
+  if (!timeline.current_session().done_initial_exec()) {
     return false;
   }
   Task* t = timeline.current_session().current_task();
@@ -1018,7 +1196,7 @@ bool GdbServer::at_target() {
   return timeline.current_session().current_trace_frame().time() >
              target.event &&
          (!target.pid || t->tgid() == target.pid) &&
-         (!target.require_exec || t->vm()->execed()) &&
+         (!target.require_exec || t->execed()) &&
          // Ensure we're at the start of processing an event. We don't
          // want to attach while we're finishing an exec() since that's a
          // slightly confusing state for ReplayTimeline's reverse execution.
@@ -1131,6 +1309,93 @@ void GdbServer::restart_session(const GdbRequest& req) {
   activate_debugger();
 }
 
+static uint32_t get_cpu_features(SupportedArch arch) {
+  uint32_t cpu_features;
+  switch (arch) {
+    case x86:
+      cpu_features = 0;
+      break;
+    case x86_64:
+      cpu_features = GdbConnection::CPU_64BIT;
+      break;
+    default:
+      FATAL() << "Unknown architecture";
+      return 0;
+  }
+
+  unsigned int AVX_cpuid_flags = AVX_FEATURE_FLAG | OSXSAVE_FEATURE_FLAG;
+  auto cpuid_data = cpuid(CPUID_GETFEATURES, 0);
+  // We're assuming here that AVX support on the system making the recording
+  // is the same as the AVX support during replay. But if that's not true,
+  // rr is totally broken anyway.
+  if ((cpuid_data.ecx & AVX_cpuid_flags) == AVX_cpuid_flags) {
+    cpu_features |= GdbConnection::CPU_AVX;
+  }
+
+  return cpu_features;
+}
+
+static const char connection_addr[] = "127.0.0.1";
+
+struct DebuggerParams {
+  char exe_image[PATH_MAX];
+  short port;
+};
+
+static void push_default_gdb_options(vector<string>& vec) {
+  vec.push_back("-l");
+  vec.push_back("10000");
+}
+
+static void push_target_remote_cmd(vector<string>& vec, unsigned short port) {
+  vec.push_back("-ex");
+  stringstream ss;
+  ss << "target extended-remote :";
+  ss << port;
+  vec.push_back(ss.str());
+}
+
+/**
+ * Wait for exactly one gdb host to connect to this remote target on
+ * IP address 127.0.0.1, port |port|.  If |probe| is nonzero, a unique
+ * port based on |start_port| will be searched for.  Otherwise, if
+ * |port| is already bound, this function will fail.
+ *
+ * Pass the |tgid| of the task on which this debug-connection request
+ * is being made.  The remaining debugging session will be limited to
+ * traffic regarding |tgid|, but clients don't need to and shouldn't
+ * need to assume that.
+ *
+ * If we're opening this connection on behalf of a known client, pass
+ * an fd in |client_params_fd|; we'll write the allocated port and |exe_image|
+ * through the fd before waiting for a connection. |exe_image| is the
+ * process that will be debugged by client, or null ptr if there isn't
+ * a client.
+ *
+ * This function is infallible: either it will return a valid
+ * debugging context, or it won't return.
+ */
+static unique_ptr<GdbConnection> await_connection(
+    Task* t, ScopedFd& listen_fd, const GdbConnection::Features& features) {
+  auto dbg = unique_ptr<GdbConnection>(new GdbConnection(t->tgid(), features));
+  dbg->set_cpu_features(get_cpu_features(t->arch()));
+  dbg->await_debugger(listen_fd);
+  return dbg;
+}
+
+static void print_debugger_launch_command(Task* t, unsigned short port,
+                                          const char* debugger_name,
+                                          FILE* out) {
+  vector<string> options;
+  push_default_gdb_options(options);
+  push_target_remote_cmd(options, port);
+  fprintf(out, "%s ", debugger_name);
+  for (auto& opt : options) {
+    fprintf(out, "'%s' ", opt.c_str());
+  }
+  fprintf(out, "%s\n", t->vm()->exe_image().c_str());
+}
+
 void GdbServer::serve_replay(const ConnectionFlags& flags) {
   do {
     ReplayResult result =
@@ -1147,12 +1412,24 @@ void GdbServer::serve_replay(const ConnectionFlags& flags) {
   // presumably break if a different port were to be selected by
   // rr (otherwise why would they specify a port in the first
   // place).  So fail with a clearer error message.
-  auto probe = flags.dbg_port > 0 ? GdbConnection::DONT_PROBE
-                                  : GdbConnection::PROBE_PORT;
+  auto probe = flags.dbg_port > 0 ? DONT_PROBE : PROBE_PORT;
   Task* t = timeline.current_session().current_task();
-  dbg = GdbConnection::await_client_connection(
-      port, probe, t->tgid(), t->vm()->exe_image(), GdbConnection::Features(),
-      flags.debugger_params_write_pipe);
+  ScopedFd listen_fd = open_socket(connection_addr, &port, probe);
+  if (flags.debugger_params_write_pipe) {
+    DebuggerParams params;
+    memset(&params, 0, sizeof(params));
+    strncpy(params.exe_image, t->vm()->exe_image().c_str(),
+            sizeof(params.exe_image) - 1);
+    params.port = port;
+
+    ssize_t nwritten =
+        write(*flags.debugger_params_write_pipe, &params, sizeof(params));
+    assert(nwritten == sizeof(params));
+  } else {
+    fputs("Launch gdb with\n  ", stderr);
+    print_debugger_launch_command(t, port, flags.debugger_name.c_str(), stderr);
+  }
+
   if (flags.debugger_params_write_pipe) {
     flags.debugger_params_write_pipe->close();
   }
@@ -1163,20 +1440,106 @@ void GdbServer::serve_replay(const ConnectionFlags& flags) {
     timeline.set_reverse_execution_barrier_event(first_run_event);
   }
 
-  activate_debugger();
+  do {
+    LOG(debug) << "initializing debugger connection";
+    dbg = await_connection(t, listen_fd, GdbConnection::Features());
+    activate_debugger();
 
-  GdbRequest last_resume_request;
-  while (debug_one_step(last_resume_request) == CONTINUE_DEBUGGING) {
-  }
+    GdbRequest last_resume_request;
+    while (debug_one_step(last_resume_request) == CONTINUE_DEBUGGING) {
+    }
+
+    timeline.remove_breakpoints_and_watchpoints();
+  } while (flags.keep_listening);
 
   LOG(debug) << "debugger server exiting ...";
 }
 
+static string create_gdb_command_file(const string& macros) {
+  TempFile file = create_temporary_file("rr-gdb-commands-XXXXXX");
+  // This fd is just leaked. That's fine since we only call this once
+  // per rr invocation at the moment.
+  int fd = file.fd.extract();
+  unlink(file.name.c_str());
+
+  ssize_t len = macros.size();
+  int written = write(fd, macros.c_str(), len);
+  if (written != len) {
+    FATAL() << "Failed to write gdb command file";
+  }
+
+  stringstream procfile;
+  procfile << "/proc/" << getpid() << "/fd/" << fd;
+  return procfile.str();
+}
+
+static string to_string(const vector<string>& args) {
+  stringstream ss;
+  for (auto& a : args) {
+    ss << "'" << a << "' ";
+  }
+  return ss.str();
+}
+
+/**
+ * Exec gdb using the params that were written to
+ * |params_pipe_fd|.  Optionally, pre-define in the gdb client the set
+ * of macros defined in |macros| if nonnull.
+ */
 void GdbServer::launch_gdb(ScopedFd& params_pipe_fd,
-                           const string& gdb_command_file_path,
-                           const string& gdb_binary_file_path) {
-  GdbConnection::launch_gdb(params_pipe_fd, gdb_rr_macros(),
-                            gdb_command_file_path, gdb_binary_file_path);
+                           const string& gdb_binary_file_path,
+                           const vector<string>& gdb_options) {
+  auto macros = gdb_rr_macros();
+  string gdb_command_file = create_gdb_command_file(macros);
+
+  DebuggerParams params;
+  ssize_t nread;
+  while (true) {
+    nread = read(params_pipe_fd, &params, sizeof(params));
+    if (nread == 0) {
+      // pipe was closed. Probably rr failed/died.
+      return;
+    }
+    if (nread != -1 || errno != EINTR) {
+      break;
+    }
+  }
+  assert(nread == sizeof(params));
+
+  vector<string> args;
+  args.push_back(gdb_binary_file_path);
+  // The gdb protocol uses the "vRun" packet to reload
+  // remote targets.  The packet is specified to be like
+  // "vCont", in which gdb waits infinitely long for a
+  // stop reply packet.  But in practice, gdb client
+  // expects the vRun to complete within the remote-reply
+  // timeout, after which it issues vCont.  The timeout
+  // causes gdb<-->rr communication to go haywire.
+  //
+  // rr can take a very long time indeed to send the
+  // stop-reply to gdb after restarting replay; the time
+  // to reach a specified execution target is
+  // theoretically unbounded.  Timing out on vRun is
+  // technically a gdb bug, but because the rr replay and
+  // the gdb reload models don't quite match up, we'll
+  // work around it on the rr side by disabling the
+  // remote-reply timeout.
+  push_default_gdb_options(args);
+  args.insert(args.end(), gdb_options.begin(), gdb_options.end());
+  args.push_back("-x");
+  args.push_back(gdb_command_file);
+  push_target_remote_cmd(args, params.port);
+  args.push_back(params.exe_image);
+
+  vector<string> env = current_env();
+  env.push_back("GDB_UNDER_RR=1");
+
+  LOG(debug) << "launching " << to_string(args);
+
+  StringVectorToCharArray c_args(args);
+  StringVectorToCharArray c_env(env);
+  execvpe(gdb_binary_file_path.c_str(), c_args.get(), c_env.get());
+  FATAL() << "Failed to exec gdb.";
 }
 
 void GdbServer::emergency_debug(Task* t) {
@@ -1197,11 +1560,29 @@ void GdbServer::emergency_debug(Task* t) {
   // b) some gdb versions will fail if the user doesn't turn off async
   // mode (and we don't want to require users to do that)
   features.reverse_execution = false;
-  unique_ptr<GdbConnection> dbg = GdbConnection::await_client_connection(
-      t->tid, GdbConnection::PROBE_PORT, t->tgid(), t->vm()->exe_image(),
-      features);
+  unsigned short port = t->tid;
+  ScopedFd listen_fd = open_socket(connection_addr, &port, PROBE_PORT);
+
+  char* test_monitor_pid = getenv("RUNNING_UNDER_TEST_MONITOR");
+  if (test_monitor_pid) {
+    pid_t pid = atoi(test_monitor_pid);
+    // Tell test-monitor to wake up and take a snapshot. It will also
+    // connect the emergency debugger so let that happen.
+    FILE* gdb_cmd = fopen("gdb_cmd", "w");
+    if (gdb_cmd) {
+      print_debugger_launch_command(t, port, "gdb", gdb_cmd);
+      fclose(gdb_cmd);
+    }
+    kill(pid, SIGURG);
+  } else {
+    fputs("Launch gdb with\n  ", stderr);
+    print_debugger_launch_command(t, port, "gdb", stderr);
+  }
+  unique_ptr<GdbConnection> dbg = await_connection(t, listen_fd, features);
 
   GdbServer(dbg, t).process_debugger_requests();
 }
 
 string GdbServer::init_script() { return gdb_rr_macros(); }
+
+} // namespace rr

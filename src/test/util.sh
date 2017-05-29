@@ -49,6 +49,12 @@ function delay_kill { sig=$1; delay_secs=$2; proc=$3
         exit 1
     fi
 
+    # Wait for the test to print "ready", indicating it has completed
+    # any required setup.
+    until grep -q ready record.out; do
+        sleep 0
+    done
+
     kill -s $sig $pid
     if [[ $? != 0 ]]; then
         # Sometimes we fail to deliver a signal to a process because
@@ -98,18 +104,10 @@ GLOBAL_OPTIONS="$DEFAULT_FLAGS"
 # just after sourcing this file.
 GLOBAL_OPTIONS_BIND_CPU="$DEFAULT_FLAGS"
 
-LIB_ARG=$1
-SRCDIR=$2
-if [[ ! -d "$SRCDIR" ]]; then
-    fatal "FAILED: srcdir missing"
-fi
-OBJDIR=$3
-if [[ "$OBJDIR" == "" ]]; then
-    # Default to assuming that the user's working directory is the
-    # test/ directory within the rr clone.
-    OBJDIR=`realpath ../../../obj`
-fi
-TESTNAME=$4
+SRCDIR=`dirname $0`/../..
+SRCDIR=`realpath $SRCDIR`
+
+TESTNAME=$1
 if [[ "$TESTNAME" == "" ]]; then
     [[ $0 =~ ([A-Za-z0-9_]+)\.run$ ]] || fatal "FAILED: bad test script name"
     TESTNAME=${BASH_REMATCH[1]}
@@ -119,6 +117,23 @@ if [[ $TESTNAME =~ ([A-Za-z0-9_]+)_32$ ]]; then
     TESTNAME_NO_BITNESS=${BASH_REMATCH[1]}
 else
     TESTNAME_NO_BITNESS=$TESTNAME
+fi
+LIB_ARG=$2
+if [[ "$LIB_ARG" == "" ]]; then
+    LIB_ARG=-b
+fi
+OBJDIR=$3
+if [[ "$OBJDIR" == "" ]]; then
+    # Default to assuming that the user's working directory is the
+    # src/test/ directory within the rr clone.
+    OBJDIR=`realpath $SRCDIR/../obj`
+fi
+if [[ ! -d "$OBJDIR" ]]; then
+    fatal "FAILED: objdir missing"
+fi
+TIMEOUT=$4
+if [[ "$TIMEOUT" == "" ]]; then
+    TIMEOUT=120
 fi
 
 # The temporary directory we create for this test run.
@@ -132,8 +147,10 @@ nonce=
 # Set up the environment and working directory.
 TESTDIR="${SRCDIR}/src/test"
 
+# Make rr treat temp files as durable. This saves copying all test
+# binaries into the trace.
+export RR_TRUST_TEMP_FILES=1
 export PATH="${OBJDIR}/bin:${PATH}"
-export LD_LIBRARY_PATH="${OBJDIR}/lib:/usr/local/lib:${LD_LIBRARY_PATH}"
 
 which rr >/dev/null 2>&1
 if [[ "$?" != "0" ]]; then
@@ -191,7 +208,7 @@ function skip_if_syscall_buf {
 }
 
 function just_record { exe=$1; exeargs=$2;
-    _RR_TRACE_DIR="$workdir" \
+    _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT record.err \
         rr $GLOBAL_OPTIONS record $LIB_ARG $RECORD_ARGS $exe $exeargs 1> record.out 2> record.err
 }
 
@@ -217,21 +234,33 @@ function record_async_signal { sig=$1; delay_secs=$2; exe=$3; exeargs=$4;
 }
 
 function replay { replayflags=$1
-    _RR_TRACE_DIR="$workdir" \
+    _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT replay.err \
         rr $GLOBAL_OPTIONS replay -a $replayflags 1> replay.out 2> replay.err
+}
+
+function do_ps { psflags=$1
+    _RR_TRACE_DIR="$workdir" \
+        rr $GLOBAL_OPTIONS ps $psflags
 }
 
 #  debug <expect-script-name> [replay-args]
 #
 # Load the "expect" script to drive replay of the recording of |exe|.
 function debug { expectscript=$1; replayargs=$2
-    _RR_TRACE_DIR="$workdir" \
+    _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT debug.err \
         python2 $TESTDIR/$expectscript.py \
-        rr $GLOBAL_OPTIONS replay -x $TESTDIR/test_setup.gdb $replayargs
+        rr $GLOBAL_OPTIONS replay -o-n -x $TESTDIR/test_setup.gdb $replayargs
     if [[ $? == 0 ]]; then
         passed
     else
         failed "debug script failed"
+        echo "--------------------------------------------------"
+        echo "gdb_rr.log:"
+        cat gdb_rr.log
+        echo "--------------------------------------------------"
+        echo "debug.err:"
+        cat debug.err
+        echo "--------------------------------------------------"
     fi
 }
 
@@ -259,6 +288,11 @@ function check { token=$1;
         echo "--------------------------------------------------"
         cat record.out
         echo "--------------------------------------------------"
+    elif [[ "$token" != "" && "record.out" != $(grep -l "$token" record.out) ]]; then
+        failed ": token '$token' not in record.out:"
+        echo "--------------------------------------------------"
+        cat record.out
+        echo "--------------------------------------------------"
     elif [[ $(cat replay.err) != "" ]]; then
         failed ": error during replay:"
         echo "--------------------------------------------------"
@@ -272,11 +306,6 @@ function check { token=$1;
         failed ": output from recording different than replay"
         echo "diff -U8 $workdir/record.out $workdir/replay.out"
         diff -U8 record.out replay.out
-    elif [[ "$token" != "" && "record.out" != $(grep -l "$token" record.out) ]]; then
-        failed ": token '$token' not in record.out:"
-        echo "--------------------------------------------------"
-        cat record.out
-        echo "--------------------------------------------------"
     else
         passed
     fi

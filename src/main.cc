@@ -12,10 +12,12 @@
 
 #include "Command.h"
 #include "Flags.h"
-#include "log.h"
 #include "RecordCommand.h"
+#include "log.h"
 
 using namespace std;
+
+namespace rr {
 
 // Show version and quit.
 static bool show_version = false;
@@ -94,12 +96,8 @@ void check_performance_settings() {
 
 void print_version(FILE* out) { fprintf(out, "rr version %s\n", RR_VERSION); }
 
-void print_usage(FILE* out) {
-  print_version(out);
-  fputs("Usage:\n", out);
-  Command::print_help_all(out);
+void print_global_options(FILE* out) {
   fputs(
-      "\n"
       "Common options:\n"
       "  -A, --microarch=<NAME>     force rr to assume it's running on a CPU\n"
       "                             with microarch NAME even if runtime "
@@ -145,9 +143,17 @@ void print_usage(FILE* out) {
       "  -T, --dump-at=TIME         dump memory at global timepoint TIME\n"
       "  -V, --verbose              log messages that may not be urgently \n"
       "                             critical to the user\n"
-      "  -W, --wait-secs=<NUM_SECS> wait NUM_SECS seconds just after startup,\n"
-      "                             before initiating recording or replaying\n",
+      "\n"
+      "Use RR_LOG to control logging; e.g. RR_LOG=all:warn,Task:debug\n",
       out);
+}
+
+void print_usage(FILE* out) {
+  print_version(out);
+  fputs("Usage:\n", out);
+  Command::print_help_all(out);
+  fputc('\n', out);
+  print_global_options(out);
 }
 
 static void init_random() {
@@ -196,7 +202,11 @@ bool parse_global_option(std::vector<std::string>& args) {
       }
       break;
     case 'D':
-      flags.dump_on = atoi(opt.value.c_str());
+      if (opt.value == "RDTSC") {
+        flags.dump_on = Flags::DUMP_ON_RDTSC;
+      } else {
+        flags.dump_on = atoi(opt.value.c_str());
+      }
       break;
     case 'E':
       flags.fatal_errors_and_warnings = true;
@@ -216,9 +226,6 @@ bool parse_global_option(std::vector<std::string>& args) {
     case 'T':
       flags.dump_at = atoi(opt.value.c_str());
       break;
-    case 'V':
-      flags.verbose = true;
-      break;
     case 'N':
       show_version = true;
       break;
@@ -227,6 +234,10 @@ bool parse_global_option(std::vector<std::string>& args) {
   }
   return true;
 }
+
+} // namespace rr
+
+using namespace rr;
 
 int main(int argc, char* argv[]) {
   init_random();

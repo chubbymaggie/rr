@@ -4,9 +4,11 @@
 #define RR_SCOPED_FD_H_
 
 #include <fcntl.h>
-#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
+
+namespace rr {
 
 /**
  * RAII helper to open a file and then close the fd when the helper
@@ -22,6 +24,7 @@ public:
   ~ScopedFd() { close(); }
 
   ScopedFd& operator=(ScopedFd&& other) {
+    close();
     fd = other.fd;
     other.fd = -1;
     return *this;
@@ -29,6 +32,11 @@ public:
 
   operator int() const { return get(); }
   int get() const { return fd; }
+  int extract() {
+    int result = fd;
+    fd = -1;
+    return result;
+  }
 
   bool is_open() { return fd >= 0; }
   void close() {
@@ -41,5 +49,7 @@ public:
 private:
   int fd;
 };
+
+} // namespace rr
 
 #endif // RR_SCOPED_FD_H

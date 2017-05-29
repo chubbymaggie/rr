@@ -14,7 +14,8 @@ int main(void) {
   int status;
   int pipe_fds[2];
 
-  p = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED,
+  size_t page_size = sysconf(_SC_PAGESIZE);
+  p = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED,
            -1, 0);
   test_assert(MAP_FAILED != p);
   p[0] = 0;
@@ -28,7 +29,7 @@ int main(void) {
     signal(SIGSEGV, sighandler);
     p[0] = 77;
     /* trigger SIGSEGV */
-    *(char*)NULL = 0;
+    crash_null_deref();
     return 77;
   }
 

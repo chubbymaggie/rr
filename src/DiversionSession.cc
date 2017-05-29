@@ -1,17 +1,17 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "DiversionSession"
-
 #include "DiversionSession.h"
 
 #include "AutoRemoteSyscalls.h"
-#include "log.h"
 #include "ReplaySession.h"
+#include "kernel_metadata.h"
+#include "log.h"
 
-using namespace rr;
+using namespace std;
 
-DiversionSession::DiversionSession(const ReplaySession& other)
-    : emu_fs(other.emufs().clone()) {}
+namespace rr {
+
+DiversionSession::DiversionSession() : emu_fs(EmuFs::create()) {}
 
 DiversionSession::~DiversionSession() {
   // We won't permanently leak any OS resources by not ensuring
@@ -20,7 +20,6 @@ DiversionSession::~DiversionSession() {
   // resources.
   kill_all_tasks();
   assert(tasks().size() == 0 && vms().size() == 0);
-  emu_fs->gc(*this);
   assert(emu_fs->size() == 0);
 }
 
@@ -51,18 +50,16 @@ template <typename Arch>
 static void process_syscall_arch(Task* t, int syscallno) {
   LOG(debug) << "Processing " << t->syscall_name(syscallno);
 
-  switch (syscallno) {
+  if (syscallno == Arch::ioctl && t->is_desched_event_syscall()) {
     // The arm/disarm-desched ioctls are emulated as no-ops.
     // However, because the rr preload library expects these
     // syscalls to succeed and aborts if they don't, we fudge a
     // "0" return value.
-    case Arch::ioctl:
-      if (!t->is_desched_event_syscall()) {
-        break;
-      }
-      finish_emulated_syscall_with_ret(t, 0);
-      return;
+    finish_emulated_syscall_with_ret(t, 0);
+    return;
+  }
 
+  switch (syscallno) {
     // We blacklist these syscalls because the params include
     // namespaced identifiers that are different in replay than
     // recording, and during replay they may refer to different,
@@ -88,9 +85,12 @@ static void process_syscall_arch(Task* t, int syscallno) {
     case Arch::rt_tgsigqueueinfo:
     case Arch::tgkill:
     case Arch::tkill:
+      LOG(debug) << "Suppressing syscall "
+                 << syscall_name(syscallno, t->arch());
       return;
   }
 
+  LOG(debug) << "Executing syscall " << syscall_name(syscallno, t->arch());
   return execute_syscall(t);
 }
 
@@ -115,10 +115,12 @@ DiversionSession::DiversionResult DiversionSession::diversion_step(
     return result;
   }
 
-  if (t->syscallbuf_hdr) {
-    // Disable syscall buffering during diversions
-    t->syscallbuf_hdr->locked = 1;
+  // Disable syscall buffering during diversions
+  if (t->preload_globals) {
+    t->write_mem(REMOTE_PTR_FIELD(t->preload_globals, in_diversion),
+                 (unsigned char)1);
   }
+  t->set_syscallbuf_locked(1);
 
   switch (command) {
     case RUN_CONTINUE:
@@ -127,9 +129,9 @@ DiversionSession::DiversionResult DiversionSession::diversion_step(
                           signal_to_deliver);
       break;
     case RUN_SINGLESTEP:
+      LOG(debug) << "Stepping to next insn/syscall";
       t->resume_execution(RESUME_SYSEMU_SINGLESTEP, RESUME_WAIT,
                           RESUME_UNLIMITED_TICKS, signal_to_deliver);
-      LOG(debug) << "Stepping to next insn/syscall";
       break;
     default:
       FATAL() << "Illegal run command " << command;
@@ -141,8 +143,13 @@ DiversionSession::DiversionResult DiversionSession::diversion_step(
   }
 
   result.status = DIVERSION_CONTINUE;
-  if (t->pending_sig()) {
-    result.break_status = diagnose_debugger_trap(t);
+  if (t->stop_sig()) {
+    LOG(debug) << "Pending signal: " << t->get_siginfo();
+    result.break_status = diagnose_debugger_trap(t, command);
+    LOG(debug) << "Diversion break at ip=" << (void*)t->ip().register_value()
+               << "; break=" << result.break_status.breakpoint_hit
+               << ", watch=" << !result.break_status.watchpoints_hit.empty()
+               << ", singlestep=" << result.break_status.singlestep_complete;
     ASSERT(t, !result.break_status.singlestep_complete ||
                   command == RUN_SINGLESTEP);
     return result;
@@ -152,3 +159,5 @@ DiversionSession::DiversionResult DiversionSession::diversion_step(
   check_for_watchpoint_changes(t, result.break_status);
   return result;
 }
+
+} // namespace rr

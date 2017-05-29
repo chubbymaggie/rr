@@ -12,40 +12,56 @@
 #include "ExtraRegisters.h"
 #include "PerfCounters.h"
 #include "TraceFrame.h"
+#include "WaitStatus.h"
+
+namespace rr {
 
 class TraceReader;
 class TraceWriter;
 
 class TraceTaskEvent {
 public:
-  TraceTaskEvent(pid_t tid, pid_t parent_tid)
-      : type_(FORK), tid_(tid), parent_tid_(parent_tid) {}
-  TraceTaskEvent(pid_t tid, pid_t parent_tid, uint32_t clone_flags)
-      : type_(CLONE),
-        tid_(tid),
-        parent_tid_(parent_tid),
-        clone_flags_(clone_flags) {}
-  TraceTaskEvent(pid_t tid, const std::string& file_name,
-                 const std::vector<std::string> cmd_line)
-      : type_(EXEC), tid_(tid), file_name_(file_name), cmd_line_(cmd_line) {}
-  TraceTaskEvent(pid_t tid) : type_(EXIT), tid_(tid) {}
-  TraceTaskEvent() : type_(NONE) {}
-
   enum Type {
     NONE,
-    CLONE, // created by clone(2) syscall
-    FORK,  // created by fork(2) syscall
+    CLONE, // created by clone(2), fork(2), vfork(2) syscalls
     EXEC,
     EXIT
   };
 
+  TraceTaskEvent(Type type = NONE, pid_t tid = 0) : type_(type), tid_(tid) {}
+
+  static TraceTaskEvent for_clone(pid_t tid, pid_t parent_tid, pid_t own_ns_tid,
+                                  uint64_t clone_flags) {
+    TraceTaskEvent result(CLONE, tid);
+    result.parent_tid_ = parent_tid;
+    result.own_ns_tid_ = own_ns_tid;
+    result.clone_flags_ = clone_flags;
+    return result;
+  }
+  static TraceTaskEvent for_exec(pid_t tid, const std::string& file_name,
+                                 const std::vector<std::string> cmd_line) {
+    TraceTaskEvent result(EXEC, tid);
+    result.file_name_ = file_name;
+    result.cmd_line_ = cmd_line;
+    return result;
+  }
+  static TraceTaskEvent for_exit(pid_t tid, WaitStatus exit_status) {
+    TraceTaskEvent result(EXIT, tid);
+    result.exit_status_ = exit_status;
+    return result;
+  }
+
   Type type() const { return type_; }
   pid_t tid() const { return tid_; }
   pid_t parent_tid() const {
-    assert(type() == CLONE || type() == FORK);
+    assert(type() == CLONE);
     return parent_tid_;
   }
-  uintptr_t clone_flags() const {
+  pid_t own_ns_tid() const {
+    assert(type() == CLONE);
+    return own_ns_tid_;
+  }
+  uint64_t clone_flags() const {
     assert(type() == CLONE);
     return clone_flags_;
   }
@@ -61,9 +77,9 @@ public:
     assert(type() == EXEC);
     return fds_to_close_;
   }
-
-  bool is_fork() const {
-    return type() == FORK || (type() == CLONE && !(clone_flags() & CLONE_VM));
+  WaitStatus exit_status() const {
+    assert(type() == EXIT);
+    return exit_status_;
   }
 
   void set_fds_to_close(const std::vector<int> fds) {
@@ -78,10 +94,14 @@ private:
   Type type_;
   pid_t tid_;
   pid_t parent_tid_;                  // CLONE only
-  uintptr_t clone_flags_;             // CLONE only
+  pid_t own_ns_tid_;                  // CLONE only
+  uint64_t clone_flags_;              // CLONE only
   std::string file_name_;             // EXEC only
   std::vector<std::string> cmd_line_; // EXEC only
   std::vector<int> fds_to_close_;     // EXEC only
+  WaitStatus exit_status_;            // EXIT only
 };
+
+} // namespace rr
 
 #endif /* RR_TRACE_TASK_EVENT_H_ */

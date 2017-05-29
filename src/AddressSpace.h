@@ -12,37 +12,29 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "preload/preload_interface.h"
 
-#include "kernel_abi.h"
+#include "EmuFs.h"
+#include "HasTaskSet.h"
 #include "MemoryRange.h"
 #include "Monkeypatcher.h"
-#include "remote_code_ptr.h"
+#include "PropertyTable.h"
 #include "TaskishUid.h"
 #include "TraceStream.h"
+#include "kernel_abi.h"
+#include "remote_code_ptr.h"
 #include "util.h"
 
+namespace rr {
+
+class AutoRemoteSyscalls;
+class MonitoredSharedMemory;
+class RecordTask;
 class Session;
 class Task;
-
-/**
- * Base class for classes that manage a set of Tasks.
- */
-class HasTaskSet {
-public:
-  typedef std::set<Task*> TaskSet;
-
-  const TaskSet& task_set() const { return tasks; }
-
-  void insert_task(Task* t);
-  void erase_task(Task* t);
-  bool has_task(Task* t) const { return tasks.find(t) != tasks.end(); }
-
-protected:
-  TaskSet tasks;
-};
 
 /**
  * Records information that the kernel knows about a mapping. This includes
@@ -159,6 +151,7 @@ public:
     memset(&fake_stat, 0, sizeof(fake_stat));
     fake_stat.st_dev = device();
     fake_stat.st_ino = inode();
+    fake_stat.st_size = size();
     return fake_stat;
   }
 
@@ -184,24 +177,22 @@ inline std::ostream& operator<<(std::ostream& o, const KernelMapping& m) {
  * represents one byte within a mapping |b|, then |a| and |b| will be
  * considered equivalent.
  *
- * If |a| and |b| don't overlap, return true if |a|'s start addres is
+ * If |a| and |b| don't overlap, return true if |a|'s start address is
  * less than |b|'s/
  */
 struct MappingComparator {
   bool operator()(const MemoryRange& a, const MemoryRange& b) const {
-    return a.intersects(b) ? false : a.start() < b.start();
+    return !a.intersects(b) && a.start() < b.start();
   }
 };
 
-enum TrapType {
-  TRAP_NONE = 0,
-  // Trap for debugger 'stepi' request.
-  TRAP_STEPI,
+enum BreakpointType {
+  BKPT_NONE = 0,
   // Trap for internal rr purposes, f.e. replaying async
   // signals.
-  TRAP_BKPT_INTERNAL,
+  BKPT_INTERNAL,
   // Trap on behalf of a debugger user.
-  TRAP_BKPT_USER,
+  BKPT_USER,
 };
 
 enum WatchType {
@@ -240,9 +231,13 @@ class AddressSpace : public HasTaskSet {
 public:
   class Mapping {
   public:
-    Mapping(const KernelMapping& map, const KernelMapping& recorded_map)
-        : map(map), recorded_map(recorded_map) {}
-    Mapping(const Mapping&) = default;
+    Mapping(const KernelMapping& map, const KernelMapping& recorded_map,
+            EmuFile::shr_ptr emu_file,
+            std::unique_ptr<struct stat> mapped_file_stat = nullptr,
+            void* local_addr = nullptr,
+            std::shared_ptr<MonitoredSharedMemory>&& monitored = nullptr);
+    ~Mapping();
+    Mapping(const Mapping&);
     Mapping() = default;
     const Mapping& operator=(const Mapping& other) {
       this->~Mapping();
@@ -254,6 +249,34 @@ public:
     // The corresponding KernelMapping in the recording. During recording,
     // equal to 'map'.
     const KernelMapping recorded_map;
+    const EmuFile::shr_ptr emu_file;
+    std::unique_ptr<struct stat> mapped_file_stat;
+    // If this mapping has been mapped into the local address space,
+    // this is the address of the first byte of the equivalent local mapping.
+    // This mapping is always mapped as PROT_READ|PROT_WRITE regardless of the
+    // mapping's permissions in the tracee. Also note that it is the caller's
+    // responsibility to keep this alive at least as long as this mapping is
+    // present in the address space.
+    uint8_t* local_addr;
+    const std::shared_ptr<MonitoredSharedMemory> monitored_shared_memory;
+    // Flags indicate mappings that require special handling. Adjacent mappings
+    // may only be merged if their `flags` value agree.
+    enum : uint32_t {
+      FLAG_NONE = 0x0,
+      // This mapping represents a syscallbuf. It needs to handled specially
+      // during checksumming since its contents are not fully restored by the
+      // replay.
+      IS_SYSCALLBUF = 0x1,
+      // This mapping is used as our thread-local variable area for this
+      // address space
+      IS_THREAD_LOCALS = 0x2,
+      // This mapping is used for syscallbuf patch stubs
+      IS_PATCH_STUBS = 0x4,
+      // This mapping has been created by the replayer to guarantee SIGBUS
+      // in a region whose backing file was too short during recording.
+      IS_SIGBUS_REGION = 0x8
+    };
+    uint32_t flags;
   };
 
   typedef std::map<MemoryRange, Mapping, MappingComparator> MemoryMap;
@@ -277,7 +300,7 @@ public:
    * Change the program data break of this address space to
    * |addr|. Only called during recording!
    */
-  void brk(remote_ptr<void> addr, int prot);
+  void brk(Task* t, remote_ptr<void> addr, int prot);
 
   /**
    * This can only be called during recording.
@@ -294,12 +317,6 @@ public:
    * XXX/ostream-ify me.
    */
   void dump() const;
-
-  /**
-   * Return true if this was created as the result of an exec()
-   * call, instead of cloned from another address space.
-   */
-  bool execed() const { return !is_clone; }
 
   /**
    * Return tid of the first task for this address space.
@@ -328,13 +345,13 @@ public:
    * of breakpoint set at |ip() - sizeof(breakpoint_insn)|, if
    * one exists.  Otherwise return TRAP_NONE.
    */
-  TrapType get_breakpoint_type_for_retired_insn(remote_code_ptr ip);
+  BreakpointType get_breakpoint_type_for_retired_insn(remote_code_ptr ip);
 
   /**
    * Return the type of breakpoint that's been registered for
    * |addr|.
    */
-  TrapType get_breakpoint_type_at_addr(remote_code_ptr addr);
+  BreakpointType get_breakpoint_type_at_addr(remote_code_ptr addr);
 
   /**
    * Returns true when the breakpoint at |addr| is in private
@@ -343,6 +360,12 @@ public:
    * syscall.
    */
   bool is_breakpoint_in_private_read_only_memory(remote_code_ptr addr);
+
+  /**
+   * Return true if there's a breakpoint instruction at |ip|. This might
+   * be an explicit instruction, even if there's no breakpoint set via our API.
+   */
+  bool is_breakpoint_instruction(Task* t, remote_code_ptr ip);
 
   /**
    * The buffer |dest| of length |length| represents the contents of tracee
@@ -357,20 +380,41 @@ public:
    * |prot| protection and |flags|.  The pages are (possibly
    * initially) backed starting at |offset| of |res|. |fsname|, |device| and
    * |inode| are values that will appear in the /proc/<pid>/maps entry.
+   * |mapped_file_stat| is a complete copy of the 'stat' data for the mapped
+   * file, or null if this isn't a file mapping or isn't during recording.
    * |*recorded_map| is the mapping during recording, or null if the mapping
    * during recording is known to be the same as the new map (e.g. because
    * we are recording!).
+   * |local_addr| is the local address of the memory shared with the tracee,
+   * or null if it's not shared with the tracee. AddressSpace takes ownership
+   * of the shared memory and is responsible for unmapping it.
    */
-  KernelMapping map(remote_ptr<void> addr, size_t num_bytes, int prot,
-                    int flags, off64_t offset_bytes, const std::string& fsname,
-                    dev_t device, ino_t inode,
-                    const KernelMapping* recorded_map = nullptr);
+  KernelMapping map(
+      Task* t, remote_ptr<void> addr, size_t num_bytes, int prot, int flags,
+      off64_t offset_bytes, const std::string& fsname,
+      dev_t device = KernelMapping::NO_DEVICE,
+      ino_t inode = KernelMapping::NO_INODE,
+      std::unique_ptr<struct stat> mapped_file_stat = nullptr,
+      const KernelMapping* recorded_map = nullptr,
+      EmuFile::shr_ptr emu_file = nullptr, void* local_addr = nullptr,
+      std::shared_ptr<MonitoredSharedMemory>&& monitored = nullptr);
 
   /**
    * Return the mapping and mapped resource for the byte at address 'addr'.
    * There must be such a mapping.
    */
   const Mapping& mapping_of(remote_ptr<void> addr) const;
+
+  /**
+   * Detach local mapping and return it.
+   */
+  void* detach_local_mapping(remote_ptr<void> addr);
+
+  /**
+   * Return a reference to the flags of the mapping at this address, allowing
+   * manipulation. There must exist a mapping at `addr`.
+   */
+  uint32_t& mapping_flags_of(remote_ptr<void> addr);
 
   /**
    * Return true if there is some mapping for the byte at 'addr'.
@@ -427,12 +471,23 @@ public:
   friend class Maps;
   Maps maps() const { return Maps(*this, remote_ptr<void>()); }
   Maps maps_starting_at(remote_ptr<void> start) { return Maps(*this, start); }
+  Maps maps_containing_or_after(remote_ptr<void> start) {
+    if (has_mapping(start)) {
+      return Maps(*this, mapping_of(start).map.start());
+    } else {
+      return Maps(*this, start);
+    }
+  }
+
+  const std::set<remote_ptr<void>>& monitored_addrs() const {
+    return monitored_mem;
+  }
 
   /**
    * Change the protection bits of [addr, addr + num_bytes) to
    * |prot|.
    */
-  void protect(remote_ptr<void> addr, size_t num_bytes, int prot);
+  void protect(Task* t, remote_ptr<void> addr, size_t num_bytes, int prot);
 
   /**
    * Fix up mprotect registers parameters to take account of PROT_GROWSDOWN.
@@ -443,15 +498,8 @@ public:
    * Move the mapping [old_addr, old_addr + old_num_bytes) to
    * [new_addr, old_addr + new_num_bytes), preserving metadata.
    */
-  void remap(remote_ptr<void> old_addr, size_t old_num_bytes,
+  void remap(Task* t, remote_ptr<void> old_addr, size_t old_num_bytes,
              remote_ptr<void> new_addr, size_t new_num_bytes);
-
-  /**
-   * Notify that the stack segment 'mapping' has grown down to a new start
-   * address.
-   */
-  KernelMapping fix_stack_segment_start(const MemoryRange& mapping,
-                                        remote_ptr<void> new_start);
 
   /**
    * Notify that data was written to this address space by rr or
@@ -460,18 +508,27 @@ public:
   void notify_written(remote_ptr<void> addr, size_t num_bytes);
 
   /** Ensure a breakpoint of |type| is set at |addr|. */
-  bool add_breakpoint(remote_code_ptr addr, TrapType type);
+  bool add_breakpoint(remote_code_ptr addr, BreakpointType type);
   /**
    * Remove a |type| reference to the breakpoint at |addr|.  If
    * the removed reference was the last, the breakpoint is
    * destroyed.
    */
-  void remove_breakpoint(remote_code_ptr addr, TrapType type);
+  void remove_breakpoint(remote_code_ptr addr, BreakpointType type);
   /**
    * Destroy all breakpoints in this VM, regardless of their
    * reference counts.
    */
   void remove_all_breakpoints();
+
+  /**
+   * Temporarily remove the breakpoint at |addr|.
+   */
+  void suspend_breakpoint_at(remote_code_ptr addr);
+  /**
+   * Restore any temporarily removed breakpoint at |addr|.
+   */
+  void restore_breakpoint_at(remote_code_ptr addr);
 
   /**
    * Manage watchpoints.  Analogous to breakpoint-managing
@@ -505,20 +562,31 @@ public:
    */
   bool notify_watchpoint_fired(uintptr_t debug_status);
   /**
+   * Return true if any watchpoint has fired. Will keep returning true until
+   * consume_watchpoint_changes() is called.
+   */
+  bool has_any_watchpoint_changes();
+  /**
+   * Return true if an EXEC watchpoint has fired at addr since the last
+   * consume_watchpoint_changes.
+   */
+  bool has_exec_watchpoint_fired(remote_code_ptr addr);
+
+  /**
    * Return all changed watchpoints in |watches| and clear their changed flags.
    */
   std::vector<WatchConfig> consume_watchpoint_changes();
 
   /**
-   * Make [addr, addr + num_bytes) inaccesible within this
+   * Make [addr, addr + num_bytes) inaccessible within this
    * address space.
    */
-  void unmap(remote_ptr<void> addr, ssize_t num_bytes);
+  void unmap(Task* t, remote_ptr<void> addr, ssize_t num_bytes);
 
   /**
    * Notification of madvise call.
    */
-  void advise(remote_ptr<void> addr, ssize_t num_bytes, int advice);
+  void advise(Task* t, remote_ptr<void> addr, ssize_t num_bytes, int advice);
 
   /** Return the vdso mapping of this. */
   KernelMapping vdso() const;
@@ -543,9 +611,6 @@ public:
     return *monkeypatch_state;
   }
 
-  /**
-   * Call this only during recording.
-   */
   void at_preload_init(Task* t);
 
   /* The address of the syscall instruction from which traced syscalls made by
@@ -556,15 +621,8 @@ public:
   remote_code_ptr privileged_traced_syscall_ip() const {
     return privileged_traced_syscall_ip_;
   }
-  /* Start and end of the mapping of the syscallbuf code
-   * section, used to determine whether a tracee's $ip is in the
-   * lib. */
-  remote_ptr<void> syscallbuf_lib_start() const {
-    return syscallbuf_lib_start_;
-  }
-  remote_ptr<void> syscallbuf_lib_end() const { return syscallbuf_lib_end_; }
 
-  bool syscallbuf_enabled() const { return syscallbuf_lib_start_ != nullptr; }
+  bool syscallbuf_enabled() const { return syscallbuf_enabled_; }
 
   /**
    * We'll map a page of memory here into every exec'ed process for our own
@@ -579,73 +637,37 @@ public:
   static remote_ptr<void> rr_page_end() {
     return rr_page_start() + rr_page_size();
   }
-  /**
-   * ip() when we're in an untraced system call; same for all supported
-   * architectures (hence static).
-   */
-  static remote_code_ptr rr_page_ip_in_untraced_syscall() {
-    return RR_PAGE_IN_UNTRACED_SYSCALL_ADDR;
+
+  static remote_ptr<void> preload_thread_locals_start() {
+    return rr_page_start() + PAGE_SIZE;
   }
-  /**
-   * ip() when we're in an untraced replayed system call; same for all supported
-   * architectures (hence static).
-   */
-  static remote_code_ptr rr_page_ip_in_untraced_replayed_syscall() {
-    return RR_PAGE_IN_UNTRACED_REPLAYED_SYSCALL_ADDR;
+  static uint32_t preload_thread_locals_size() {
+    return PRELOAD_THREAD_LOCALS_SIZE;
   }
-  /**
-   * This doesn't need to be the same for all architectures, but may as well
-   * make it so.
-   */
-  static remote_code_ptr rr_page_ip_in_traced_syscall() {
-    return RR_PAGE_IN_TRACED_SYSCALL_ADDR;
-  }
-  /**
-   * ip() when we're in an untraced system call; same for all supported
-   * architectures (hence static).
-   */
-  static remote_code_ptr rr_page_ip_in_privileged_untraced_syscall() {
-    return RR_PAGE_IN_PRIVILEGED_UNTRACED_SYSCALL_ADDR;
-  }
-  /**
-   * This doesn't need to be the same for all architectures, but may as well
-   * make it so.
-   */
-  static remote_code_ptr rr_page_ip_in_privileged_traced_syscall() {
-    return RR_PAGE_IN_PRIVILEGED_TRACED_SYSCALL_ADDR;
-  }
+
+  enum Traced { TRACED, UNTRACED };
+  enum Privileged { PRIVILEGED, UNPRIVILEGED };
+  enum Enabled { RECORDING_ONLY, REPLAY_ONLY, RECORDING_AND_REPLAY };
+  static remote_code_ptr rr_page_syscall_exit_point(Traced traced,
+                                                    Privileged privileged,
+                                                    Enabled enabled);
+  static remote_code_ptr rr_page_syscall_entry_point(Traced traced,
+                                                     Privileged privileged,
+                                                     Enabled enabled,
+                                                     SupportedArch arch);
+
+  struct SyscallType {
+    Traced traced;
+    Privileged privileged;
+    Enabled enabled;
+  };
+  static std::vector<SyscallType> rr_page_syscalls();
+  static const SyscallType* rr_page_syscall_from_exit_point(remote_code_ptr ip);
+
   /**
    * Return a pointer to 8 bytes of 0xFF
    */
   static remote_ptr<uint8_t> rr_page_ff_bytes() { return RR_PAGE_FF_BYTES; }
-  /**
-   * ip() of the untraced traced system call instruction.
-   */
-  remote_code_ptr rr_page_untraced_syscall_ip(SupportedArch arch) {
-    return rr_page_ip_in_untraced_syscall().decrement_by_syscall_insn_length(
-        arch);
-  }
-  /**
-   * ip() of the traced traced system call instruction.
-   */
-  remote_code_ptr rr_page_traced_syscall_ip(SupportedArch arch) {
-    return rr_page_ip_in_traced_syscall().decrement_by_syscall_insn_length(
-        arch);
-  }
-  /**
-   * ip() of the privileged untraced traced system call instruction.
-   */
-  remote_code_ptr rr_page_privileged_untraced_syscall_ip(SupportedArch arch) {
-    return rr_page_ip_in_privileged_untraced_syscall()
-        .decrement_by_syscall_insn_length(arch);
-  }
-  /**
-   * ip() of the privileged traced traced system call instruction.
-   */
-  remote_code_ptr rr_page_privileged_traced_syscall_ip(SupportedArch arch) {
-    return rr_page_ip_in_privileged_traced_syscall()
-        .decrement_by_syscall_insn_length(arch);
-  }
 
   /**
    * Locate a syscall instruction in t's VDSO.
@@ -674,28 +696,64 @@ public:
    */
   KernelMapping read_kernel_mapping(Task* t, remote_ptr<void> addr);
 
+  /**
+   * Same as read_kernel_mapping, but reads rr's own memory map.
+   */
+  static KernelMapping read_local_kernel_mapping(uint8_t* addr);
+
   static uint32_t chaos_mode_min_stack_size() { return 8 * 1024 * 1024; }
 
   remote_ptr<void> chaos_mode_find_free_memory(Task* t, size_t len);
+  remote_ptr<void> find_free_memory(
+      size_t len, remote_ptr<void> after = remote_ptr<void>());
+
+  PropertyTable& properties() { return properties_; }
+
+  void post_vm_clone(Task* t);
+  /**
+   * TaskUid for the task whose locals are stored in the preload_thread_locals
+   * area.
+   */
+  const TaskUid& thread_locals_tuid() { return thread_locals_tuid_; }
+  void set_thread_locals_tuid(const TaskUid& tuid) {
+    thread_locals_tuid_ = tuid;
+  }
+
+  /**
+   * Call this when the memory at [addr,addr+len) was externally overwritten.
+   * This will attempt to update any breakpoints that may be set within the
+   * range (resetting them and storing the new value).
+   */
+  void maybe_update_breakpoints(Task* t, remote_ptr<uint8_t> addr, size_t len);
 
 private:
-  class Breakpoint;
+  struct Breakpoint;
   typedef std::map<remote_code_ptr, Breakpoint> BreakpointMap;
   class Watchpoint;
 
+  /**
+   * Called after a successful execve to set up the new AddressSpace.
+   * Also called once for the initial spawn.
+   */
   AddressSpace(Task* t, const std::string& exe, uint32_t exec_count);
+  /**
+   * Called when an AddressSpace is cloned due to a fork() or a Session
+   * clone. After this, and the task is properly set up, post_vm_clone will
+   * be called.
+   */
   AddressSpace(Session* session, const AddressSpace& o, pid_t leader_tid,
                uint32_t leader_serial, uint32_t exec_count);
+
   /**
    * After an exec, populate the new address space of |t| with
    * the existing mappings we find in /proc/maps.
    */
   void populate_address_space(Task* t);
 
-  void unmap_internal(remote_ptr<void> addr, ssize_t num_bytes);
+  void unmap_internal(Task* t, remote_ptr<void> addr, ssize_t num_bytes);
 
   // Also sets brk_ptr.
-  void map_rr_page(Task* t);
+  void map_rr_page(AutoRemoteSyscalls& remote);
 
   bool update_watchpoint_value(const MemoryRange& range,
                                Watchpoint& watchpoint);
@@ -720,7 +778,7 @@ private:
    * well, for example have adjacent file offsets and the same
    * prot and flags.
    */
-  void coalesce_around(MemoryMap::iterator it);
+  void coalesce_around(Task* t, MemoryMap::iterator it);
 
   /**
    * Erase |it| from |breakpoints| and restore any memory in
@@ -748,8 +806,23 @@ private:
    * Map |m| of |r| into this address space, and coalesce any
    * mappings of |r| that are adjacent to |m|.
    */
-  void map_and_coalesce(const KernelMapping& m,
-                        const KernelMapping& recorded_map);
+  void map_and_coalesce(Task* t, const KernelMapping& m,
+                        const KernelMapping& recorded_map,
+                        EmuFile::shr_ptr emu_file,
+                        std::unique_ptr<struct stat> mapped_file_stat,
+                        void* local_addr,
+                        std::shared_ptr<MonitoredSharedMemory>&& monitored);
+
+  void remove_from_map(const MemoryRange& range) {
+    mem.erase(range);
+    monitored_mem.erase(range.start());
+  }
+  void add_to_map(const Mapping& m) {
+    mem[m.map] = m;
+    if (m.monitored_shared_memory) {
+      monitored_mem.insert(m.map.start());
+    }
+  }
 
   /**
    * Call this only during recording.
@@ -766,7 +839,7 @@ private:
    * can be multiple refcounts of multiple types set on a single
    * address, Breakpoint stores explicit USER and INTERNAL breakpoint
    * refcounts.  Clients adding/removing breakpoints at this addr must
-   * call ref()/unref() as appropropiate.
+   * call ref()/unref() as appropriate.
    */
   struct Breakpoint {
     Breakpoint() : internal_count(0), user_count(0) {}
@@ -777,24 +850,24 @@ private:
     // are valid.
     ~Breakpoint() { assert(internal_count >= 0 && user_count >= 0); }
 
-    void ref(TrapType which) {
+    void ref(BreakpointType which) {
       assert(internal_count >= 0 && user_count >= 0);
       ++*counter(which);
     }
-    int unref(TrapType which) {
+    int unref(BreakpointType which) {
       assert(internal_count > 0 || user_count > 0);
       --*counter(which);
       assert(internal_count >= 0 && user_count >= 0);
       return internal_count + user_count;
     }
 
-    TrapType type() const {
+    BreakpointType type() const {
       // NB: USER breakpoints need to be processed before
       // INTERNAL ones.  We want to give the debugger a
       // chance to dispatch commands before we attend to the
       // internal rr business.  So if there's a USER "ref"
       // on the breakpoint, treat it as a USER breakpoint.
-      return user_count > 0 ? TRAP_BKPT_USER : TRAP_BKPT_INTERNAL;
+      return user_count > 0 ? BKPT_USER : BKPT_INTERNAL;
     }
 
     size_t data_length() { return 1; }
@@ -810,9 +883,9 @@ private:
                       sizeof(AddressSpace::breakpoint_insn),
                   "Must have the same size.");
 
-    int* counter(TrapType which) {
-      assert(TRAP_BKPT_INTERNAL == which || TRAP_BKPT_USER == which);
-      int* p = TRAP_BKPT_USER == which ? &user_count : &internal_count;
+    int* counter(BreakpointType which) {
+      assert(BKPT_INTERNAL == which || BKPT_USER == which);
+      int* p = BKPT_USER == which ? &user_count : &internal_count;
       assert(*p >= 0);
       return p;
     }
@@ -883,6 +956,8 @@ private:
     bool changed;
   };
 
+  PropertyTable properties_;
+
   // All breakpoints set in this VM.
   BreakpointMap breakpoints;
   /* Path of the real executable image this address space was
@@ -897,15 +972,16 @@ private:
   remote_ptr<void> brk_start;
   /* Current brk. Not necessarily page-aligned. */
   remote_ptr<void> brk_end;
-  /* Were we cloned from another address space? */
-  bool is_clone;
   /* All segments mapped into this address space. */
   MemoryMap mem;
+  std::set<remote_ptr<void>> monitored_mem;
   /* madvise DONTFORK regions */
   std::set<MemoryRange> dont_fork;
   // The session that created this.  We save a ref to it so that
   // we can notify it when we die.
   Session* session_;
+  // tid of the task whose thread-locals are in preload_thread_locals
+  TaskUid thread_locals_tuid_;
   /* First mapped byte of the vdso. */
   remote_ptr<void> vdso_start_addr;
   // The monkeypatcher that's handling this address space.
@@ -914,7 +990,7 @@ private:
   // programmed per Task, but we track them per address space on
   // behalf of debuggers that assume that model.
   std::map<MemoryRange, Watchpoint> watchpoints;
-  std::vector<std::map<MemoryRange, Watchpoint> > saved_watchpoints;
+  std::vector<std::map<MemoryRange, Watchpoint>> saved_watchpoints;
   // Tracee memory is read and written through this fd, which is
   // opened for the tracee's magic /proc/[tid]/mem device.  The
   // advantage of this over ptrace is that we can access it even
@@ -927,8 +1003,7 @@ private:
   ScopedFd child_mem_fd;
   remote_code_ptr traced_syscall_ip_;
   remote_code_ptr privileged_traced_syscall_ip_;
-  remote_ptr<void> syscallbuf_lib_start_;
-  remote_ptr<void> syscallbuf_lib_end_;
+  bool syscallbuf_enabled_;
 
   std::vector<uint8_t> saved_auxv_;
 
@@ -954,5 +1029,37 @@ private:
 
   AddressSpace operator=(const AddressSpace&) = delete;
 };
+
+/**
+ * The following helper is used to iterate over a tracee's memory
+ * map.
+ */
+class KernelMapIterator {
+public:
+  KernelMapIterator(Task* t);
+  KernelMapIterator(pid_t tid) : tid(tid) { init(); }
+  ~KernelMapIterator();
+
+  // It's very important to keep in mind that btrfs files can have the wrong
+  // device number!
+  const KernelMapping& current(std::string* raw_line = nullptr) {
+    if (raw_line) {
+      *raw_line = this->raw_line;
+    }
+    return km;
+  }
+  bool at_end() { return !maps_file; }
+  void operator++();
+
+private:
+  void init();
+
+  pid_t tid;
+  FILE* maps_file;
+  std::string raw_line;
+  KernelMapping km;
+};
+
+} // namespace rr
 
 #endif /* RR_ADDRESS_SPACE_H_ */

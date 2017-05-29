@@ -10,8 +10,10 @@
 #include "TraceFrame.h"
 #include "util.h"
 
+namespace rr {
+
 class RecordSession;
-class Task;
+class RecordTask;
 
 /**
  * Overview of rr scheduling:
@@ -73,41 +75,42 @@ public:
    * 10ms timeslices, i.e. 500,000 ticks.
    */
   enum { DEFAULT_MAX_TICKS = 500000 };
+  /**
+   * Don't allow max_ticks to get above this value.
+   */
+  enum { MAX_MAX_TICKS = 1000000000 };
 
-  Scheduler(RecordSession& session)
-      : session(session),
-        current(nullptr),
-        high_priority_only_intervals_refresh_time(0),
-        max_ticks_(DEFAULT_MAX_TICKS),
-        events_until_reset_priorities(0),
-        always_switch(false),
-        enable_chaos(false) {}
+  Scheduler(RecordSession& session);
 
-  void set_max_ticks(Ticks max_ticks) { max_ticks_ = max_ticks; }
+  void set_max_ticks(Ticks max_ticks) {
+    assert(max_ticks <= MAX_MAX_TICKS);
+    max_ticks_ = max_ticks;
+  }
+  Ticks max_ticks() { return max_ticks_; }
   void set_always_switch(bool always_switch) {
     this->always_switch = always_switch;
   }
-  void set_enable_chaos(bool enable_chaos) {
-    this->enable_chaos = enable_chaos;
-  }
+  void set_enable_chaos(bool enable_chaos);
 
   /**
-   * Given a previously-scheduled task |t|, return a new runnable task (which
-   * may be |t|).
+   * Schedule a new runnable task (which may be the same as current()).
    *
-   * The returned task is guaranteed to either have already been
+   * The new current() task is guaranteed to either have already been
    * runnable, or have been made runnable by a waitpid status change (in
-   * which case, *by_waitpid will be nonzero.)
-   *
-   * Return nullptr if an interrupt occurred while waiting on a tracee.
+   * which case, result.by_waitpid will be true.
    */
-  Task* get_next_thread(Task* t, Switchable switchable, bool* by_waitpid);
+  struct Rescheduled {
+    bool interrupted_by_signal;
+    bool by_waitpid;
+    bool started_new_timeslice;
+  };
+  Rescheduled reschedule(Switchable switchable);
 
   /**
    * Set the priority of |t| to |value| and update related
    * state.
    */
-  void update_task_priority(Task* t, int value);
+  void update_task_priority(RecordTask* t, int value);
 
   /**
    * Do one round of round-robin scheduling if we're not already doing one.
@@ -116,18 +119,33 @@ public:
    * If the task_round_robin_queue is empty this moves all tasks into it,
    * putting last_task last.
    */
-  void schedule_one_round_robin(Task* last_task);
+  void schedule_one_round_robin(RecordTask* last_task);
 
-  void on_create(Task* t);
+  void on_create(RecordTask* t);
   /**
    * De-register a thread. This function should be called when a thread exits.
    */
-  void on_destroy(Task* t);
+  void on_destroy(RecordTask* t);
+
+  RecordTask* current() const { return current_; }
+
+  Ticks current_timeslice_end() const { return current_timeslice_end_; }
+
+  void expire_timeslice() { current_timeslice_end_ = 0; }
+
+  double interrupt_after_elapsed_time() const;
+
+  /**
+   * Return the number of cores we should report to applications.
+   */
+  int pretend_num_cores() const { return pretend_num_cores_; }
+
+  void in_stable_exit(RecordTask* t);
 
 private:
   // Tasks sorted by priority.
-  typedef std::set<std::pair<int, Task*> > TaskPrioritySet;
-  typedef std::deque<Task*> TaskQueue;
+  typedef std::set<std::pair<int, RecordTask*>> TaskPrioritySet;
+  typedef std::deque<RecordTask*> TaskQueue;
 
   /**
    * Pull a task from the round-robin queue if available. Otherwise,
@@ -135,24 +153,29 @@ private:
    * runnable task has the same priority as 't', return 't' or
    * the next runnable task after 't' in round-robin order.
    * Sets 'by_waitpid' to true if we determined the task was runnable by
-   * calling waitpid on it and observing a state change.
-   * Considers only tasks with priority <= priority_threshold
+   * calling waitpid on it and observing a state change. This task *must*
+   * be returned by get_next_thread, and is_runnable_task must not be called
+   * on it again until it has run.
+   * Considers only tasks with priority <= priority_threshold.
    */
-  Task* find_next_runnable_task(Task* t, bool* by_waitpid,
-                                int priority_threshold);
+  RecordTask* find_next_runnable_task(RecordTask* t, bool* by_waitpid,
+                                      int priority_threshold);
   /**
    * Returns the first task in the round-robin queue or null if it's empty,
    * removing it from the round-robin queue.
    */
-  Task* get_round_robin_task();
-  void maybe_pop_round_robin_task(Task* t);
-  Task* get_next_task_with_same_priority(Task* t);
-  void setup_new_timeslice(Task* t);
-  void maybe_reset_priorities();
-  int choose_random_priority();
-  void update_task_priority_internal(Task* t, int value);
-  void maybe_reset_high_priority_only_intervals();
-  bool in_high_priority_only_interval();
+  RecordTask* get_round_robin_task();
+  void maybe_pop_round_robin_task(RecordTask* t);
+  RecordTask* get_next_task_with_same_priority(RecordTask* t);
+  void setup_new_timeslice();
+  void maybe_reset_priorities(double now);
+  int choose_random_priority(RecordTask* t);
+  void update_task_priority_internal(RecordTask* t, int value);
+  void maybe_reset_high_priority_only_intervals(double now);
+  bool in_high_priority_only_interval(double now);
+  bool treat_as_high_priority(RecordTask* t);
+  bool is_task_runnable(RecordTask* t, bool* by_waitpid);
+  void validate_scheduled_task();
 
   RecordSession& session;
 
@@ -173,25 +196,24 @@ private:
    * task
    * has been destroyed.
    */
-  Task* current;
+  RecordTask* current_;
+  Ticks current_timeslice_end_;
 
-  struct SleepInterval {
-    double start;
-    double end;
-  };
   /**
-   * During these intervals we avoid running low-priority threads. If only
-   * a low-priority thread is runnable, we just sleep to give high-priority
-   * threads a chance to wake up and proceed.
-   */
-  std::vector<SleepInterval> high_priority_only_intervals;
-  /**
-   * At this time (or later) we should refresh high_priority_only_intervals
+   * At this time (or later) we should refresh these values.
    */
   double high_priority_only_intervals_refresh_time;
+  double high_priority_only_intervals_start;
+  double high_priority_only_intervals_duration;
+  double high_priority_only_intervals_period;
+  /**
+   * At this time (or later) we should rerandomize RecordTask priorities.
+   */
+  double priorities_refresh_time;
+
+  int pretend_num_cores_;
 
   Ticks max_ticks_;
-  int events_until_reset_priorities;
 
   /**
    * When true, context switch at every possible point.
@@ -202,6 +224,13 @@ private:
    * probability of finding buggy schedules.
    */
   bool enable_chaos;
+
+  bool enable_poll;
+  bool last_reschedule_in_high_priority_only_interval;
+
+  RecordTask* must_run_task;
 };
+
+} // namespace rr
 
 #endif /* RR_REC_SCHED_H_ */

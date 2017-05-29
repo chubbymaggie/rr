@@ -3,18 +3,24 @@
 #include "RecordCommand.h"
 
 #include <assert.h>
+#include <linux/capability.h>
+#include <sys/prctl.h>
 #include <sysexits.h>
 
 #include "preload/preload_interface.h"
 
 #include "Flags.h"
+#include "RecordSession.h"
+#include "StringVectorToCharArray.h"
+#include "WaitStatus.h"
 #include "kernel_metadata.h"
 #include "log.h"
 #include "main.h"
-#include "RecordSession.h"
 #include "util.h"
 
 using namespace std;
+
+namespace rr {
 
 RecordCommand RecordCommand::singleton(
     "record",
@@ -32,13 +38,38 @@ RecordCommand RecordCommand::singleton(
     "                             tests.\n"
     "  -n, --no-syscall-buffer    disable the syscall buffer preload \n"
     "                             library even if it would otherwise be used\n"
-    "  -s, --always-switch        tryto context switch at every rr event\n"
+    "  --no-file-cloning          disable file cloning for mmapped files\n"
+    "  --no-read-cloning          disable file-block cloning for syscallbuf\n"
+    "                             reads\n"
+    "  -p --print-trace-dir=<NUM> print trace directory followed by a newline\n"
+    "                             to given file descriptor\n"
+    "  --syscall-buffer-size=<NUM> desired size of syscall buffer in kB.\n"
+    "                             Mainly for tests\n"
+    "  -s, --always-switch        try to context switch at every rr event\n"
+    "  -t, --continue-through-signal=<SIG>\n"
+    "                             Unhandled <SIG> signals will be ignored\n"
+    "                             instead of terminating the program. The\n"
+    "                             signal will still be delivered for user\n"
+    "                             handlers and debugging.\n"
     "  -u, --cpu-unbound          allow tracees to run on any virtual CPU.\n"
-    "                             Default is to bind to CPU 0.  This option\n"
+    "                             Default is to bind to a random CPU.  This "
+    "option\n"
     "                             can cause replay divergence: use with\n"
     "                             caution.\n"
+    "  --bind-to-cpu=<NUM>        Bind to a particular CPU\n"
+    "                             instead of a randomly chosen one.\n"
     "  -v, --env=NAME=VALUE       value to add to the environment of the\n"
-    "                             tracee. There can be any number of these.\n");
+    "                             tracee. There can be any number of these.\n"
+    "  -w, --wait                 Wait for all child processes to exit, not\n"
+    "                             just the initial process.\n"
+    "  --ignore-nested            Directly start child process when running\n"
+    "                             under nested rr recording, instead of\n"
+    "                             raising an error.\n"
+    "  --scarce-fds               Consume 950 fds before recording\n"
+    "                             (for testing purposes)\n"
+    "  --setuid-sudo              If running under sudo, pretend to be the\n"
+    "                             user that ran sudo rather than root. This\n"
+    "                             allows recording setuid/setcap binaries.\n");
 
 struct RecordFlags {
   vector<string> extra_env;
@@ -49,44 +80,108 @@ struct RecordFlags {
   /* Whenever |ignore_sig| is pending for a tracee, decline to
    * deliver it. */
   int ignore_sig;
+  /* Whenever |continue_through_sig| is delivered to a tracee, if there is no
+   * user handler and the signal would terminate the program, just ignore it. */
+  int continue_through_sig;
 
   /* Whether to use syscall buffering optimization during recording. */
   RecordSession::SyscallBuffering use_syscall_buffer;
 
+  /* If nonzero, the desired syscall buffer size. Must be a multiple of the page
+   * size.
+   */
+  size_t syscall_buffer_size;
+
+  int print_trace_dir;
+
+  /* Whether to use file-cloning optimization during recording. */
+  bool use_file_cloning;
+
+  /* Whether to use read-cloning optimization during recording. */
+  bool use_read_cloning;
+
   /* Whether tracee processes in record and replay are allowed
    * to run on any logical CPU. */
-  RecordSession::BindCPU bind_cpu;
+  int bind_cpu;
 
   /* True if we should context switch after every rr event */
   bool always_switch;
 
   /* Whether to enable chaos mode in the scheduler */
-  RecordSession::Chaos chaos;
+  bool chaos;
+
+  /* True if we should wait for all processes to exit before finishing
+   * recording. */
+  bool wait_for_all;
+
+  /* Start child process directly if run under nested rr recording */
+  bool ignore_nested;
+
+  bool scarce_fds;
+
+  bool setuid_sudo;
 
   RecordFlags()
       : max_ticks(Scheduler::DEFAULT_MAX_TICKS),
         ignore_sig(0),
+        continue_through_sig(0),
         use_syscall_buffer(RecordSession::ENABLE_SYSCALL_BUF),
+        syscall_buffer_size(0),
+        print_trace_dir(-1),
+        use_file_cloning(true),
+        use_read_cloning(true),
         bind_cpu(RecordSession::BIND_CPU),
         always_switch(false),
-        chaos(RecordSession::DISABLE_CHAOS) {}
+        chaos(false),
+        wait_for_all(false),
+        ignore_nested(false),
+        scarce_fds(false),
+        setuid_sudo(false) {}
 };
 
-static bool parse_record_arg(std::vector<std::string>& args,
-                             RecordFlags& flags) {
+static void parse_signal_name(ParsedOption& opt) {
+  if (opt.int_value != INT64_MIN) {
+    return;
+  }
+
+  for (int i = 1; i < _NSIG; i++) {
+    std::string signame = signal_name(i);
+    if (signame == opt.value) {
+      opt.int_value = i;
+      return;
+    }
+    assert(signame[0] == 'S' && signame[1] == 'I' && signame[2] == 'G');
+    if (signame.substr(3) == opt.value) {
+      opt.int_value = i;
+      return;
+    }
+  }
+}
+
+static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
   if (parse_global_option(args)) {
     return true;
   }
 
   static const OptionSpec options[] = {
+    { 0, "no-read-cloning", NO_PARAMETER },
+    { 1, "no-file-cloning", NO_PARAMETER },
+    { 2, "syscall-buffer-size", HAS_PARAMETER },
+    { 3, "ignore-nested", NO_PARAMETER },
+    { 4, "scarce-fds", NO_PARAMETER },
+    { 5, "setuid-sudo", NO_PARAMETER },
+    { 6, "bind-to-cpu", HAS_PARAMETER },
     { 'b', "force-syscall-buffer", NO_PARAMETER },
     { 'c', "num-cpu-ticks", HAS_PARAMETER },
     { 'h', "chaos", NO_PARAMETER },
     { 'i', "ignore-signal", HAS_PARAMETER },
     { 'n', "no-syscall-buffer", NO_PARAMETER },
+    { 'p', "print-trace-dir", HAS_PARAMETER },
     { 's', "always-switch", NO_PARAMETER },
+    { 't', "continue-through-signal", HAS_PARAMETER },
     { 'u', "cpu-unbound", NO_PARAMETER },
-    { 'v', "env", HAS_PARAMETER }
+    { 'v', "env", HAS_PARAMETER },
+    { 'w', "wait", NO_PARAMETER }
   };
   ParsedOption opt;
   auto args_copy = args;
@@ -99,15 +194,17 @@ static bool parse_record_arg(std::vector<std::string>& args,
       flags.use_syscall_buffer = RecordSession::ENABLE_SYSCALL_BUF;
       break;
     case 'c':
-      if (!opt.verify_valid_int(1, INT64_MAX)) {
+      if (!opt.verify_valid_int(1, Scheduler::MAX_MAX_TICKS)) {
         return false;
       }
       flags.max_ticks = opt.int_value;
       break;
     case 'h':
-      flags.chaos = RecordSession::ENABLE_CHAOS;
+      LOG(info) << "Enabled chaos mode";
+      flags.chaos = true;
       break;
     case 'i':
+      parse_signal_name(opt);
       if (!opt.verify_valid_int(1, _NSIG - 1)) {
         return false;
       }
@@ -116,14 +213,58 @@ static bool parse_record_arg(std::vector<std::string>& args,
     case 'n':
       flags.use_syscall_buffer = RecordSession::DISABLE_SYSCALL_BUF;
       break;
+    case 'p':
+      if (!opt.verify_valid_int(0, INT32_MAX)) {
+        return false;
+      }
+      flags.print_trace_dir = opt.int_value;
+      break;
+    case 0:
+      flags.use_read_cloning = false;
+      break;
+    case 1:
+      flags.use_file_cloning = false;
+      break;
+    case 2:
+      if (!opt.verify_valid_int(4, 1024 * 1024) ||
+          (opt.int_value & (page_size() / 1024 - 1))) {
+        return false;
+      }
+      flags.syscall_buffer_size = opt.int_value * 1024;
+      break;
+    case 3:
+      flags.ignore_nested = true;
+      break;
+    case 4:
+      flags.scarce_fds = true;
+      break;
+    case 5:
+      flags.setuid_sudo = true;
+      break;
     case 's':
       flags.always_switch = true;
+      break;
+    case 't':
+      parse_signal_name(opt);
+      if (!opt.verify_valid_int(1, _NSIG - 1)) {
+        return false;
+      }
+      flags.continue_through_sig = opt.int_value;
+      break;
+    case 6:
+      if (!opt.verify_valid_int(0, INT32_MAX)) {
+        return false;
+      }
+      flags.bind_cpu = opt.int_value;
       break;
     case 'u':
       flags.bind_cpu = RecordSession::UNBOUND_CPU;
       break;
     case 'v':
       flags.extra_env.push_back(opt.value);
+      break;
+    case 'w':
+      flags.wait_for_all = true;
       break;
     default:
       assert(0 && "Unknown option");
@@ -142,13 +283,16 @@ static bool term_request;
  * If there's already a term request pending, then assume rr is wedged
  * and abort().
  */
-static void handle_SIGTERM(int sig) {
+static void handle_SIGTERM(__attribute__((unused)) int sig) {
+  // Don't use LOG() here because we're in a signal handler. If we do anything
+  // that could allocate, we could deadlock.
   if (term_request) {
-    FATAL() << "Received termsig while an earlier one was pending.  We're "
-               "probably wedged.";
+    static const char msg[] =
+        "Received SIGTERM while an earlier one was pending.  We're "
+        "probably wedged.\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    notifying_abort();
   }
-  LOG(info) << "Received termsig " << signal_name(sig)
-            << ", requesting shutdown ...\n";
   term_request = true;
 }
 
@@ -166,16 +310,35 @@ static void setup_session_from_flags(RecordSession& session,
                                      const RecordFlags& flags) {
   session.scheduler().set_max_ticks(flags.max_ticks);
   session.scheduler().set_always_switch(flags.always_switch);
+  session.set_enable_chaos(flags.chaos);
+  session.set_use_read_cloning(flags.use_read_cloning);
+  session.set_use_file_cloning(flags.use_file_cloning);
   session.set_ignore_sig(flags.ignore_sig);
+  session.set_continue_through_sig(flags.continue_through_sig);
+  session.set_wait_for_all(flags.wait_for_all);
+  if (flags.syscall_buffer_size > 0) {
+    session.set_syscall_buffer_size(flags.syscall_buffer_size);
+  }
+
+  if (flags.scarce_fds) {
+    for (int i = 0; i < 950; ++i) {
+      open("/dev/null", O_RDONLY);
+    }
+  }
 }
 
-static int record(const vector<string>& args, const RecordFlags& flags) {
+static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
   LOG(info) << "Start recording...";
 
-  auto session =
-      RecordSession::create(args, flags.extra_env, flags.use_syscall_buffer,
-                            flags.bind_cpu, flags.chaos);
+  auto session = RecordSession::create(
+      args, flags.extra_env, flags.use_syscall_buffer, flags.bind_cpu);
   setup_session_from_flags(*session, flags);
+
+  if (flags.print_trace_dir >= 0) {
+    const string& dir = session->trace_writer().dir();
+    write(flags.print_trace_dir, dir.c_str(), dir.size());
+    write(flags.print_trace_dir, "\n", 1);
+  }
 
   // Install signal handlers after creating the session, to ensure they're not
   // inherited by the tracee.
@@ -183,7 +346,11 @@ static int record(const vector<string>& args, const RecordFlags& flags) {
 
   RecordSession::RecordResult step_result;
   do {
+    bool done_initial_exec = session->done_initial_exec();
     step_result = session->record_step();
+    if (!done_initial_exec && session->done_initial_exec()) {
+      session->trace_writer().make_latest_trace();
+    }
   } while (step_result.status == RecordSession::STEP_CONTINUE && !term_request);
 
   session->terminate_recording();
@@ -191,46 +358,86 @@ static int record(const vector<string>& args, const RecordFlags& flags) {
   switch (step_result.status) {
     case RecordSession::STEP_CONTINUE:
       // SIGINT or something like that interrupted us.
-      return 0x80 | SIGINT;
+      return WaitStatus::for_fatal_sig(SIGINT);
 
     case RecordSession::STEP_EXITED:
-      return step_result.exit_code;
+      return step_result.exit_status;
 
-    case RecordSession::STEP_EXEC_FAILED:
-      fprintf(stderr,
-              "\n"
-              "rr: error:\n"
-              "  Unexpected `write()' call from first tracee process.\n"
-              "  Most likely, the executable image `%s' is 64-bit, doesn't "
-              "exist, or\n"
-              "  isn't in your $PATH.  Terminating recording.\n"
-              "\n",
-              session->trace_writer().initial_exe().c_str());
-      return EX_NOINPUT;
-
-    case RecordSession::STEP_PERF_COUNTERS_UNAVAILABLE:
-      fprintf(stderr, "\n"
-                      "rr: internal recorder error:\n"
-                      "  Performance counter doesn't seem to be working.  Are "
-                      "you perhaps\n"
-                      "  running rr in a VM but didn't enable perf-counter "
-                      "virtualization?\n");
-      return EX_UNAVAILABLE;
+    case RecordSession::STEP_SPAWN_FAILED:
+      cerr << "\n" << step_result.failure_message << "\n";
+      return WaitStatus::for_exit_code(EX_UNAVAILABLE);
 
     default:
       assert(0 && "Unknown exit status");
-      return -1;
+      return WaitStatus();
   }
 }
 
-int RecordCommand::run(std::vector<std::string>& args) {
-  if (getenv("RUNNING_UNDER_RR")) {
-    fprintf(stderr, "rr: cannot run rr recording under rr. Exiting.\n");
-    return 1;
+static void exec_child(vector<string>& args) {
+  execvp(args[0].c_str(), StringVectorToCharArray(args).get());
+  // That failed. Try executing the file directly.
+  execv(args[0].c_str(), StringVectorToCharArray(args).get());
+  switch (errno) {
+    case ENOENT:
+      fprintf(stderr, "execv failed: '%s' (or interpreter) not found (%s)",
+              args[0].c_str(), errno_name(errno).c_str());
+      break;
+    default:
+      fprintf(stderr, "execv of '%s' failed (%s)", args[0].c_str(),
+              errno_name(errno).c_str());
+      break;
   }
+  _exit(1);
+  // Never returns!
+}
 
+static void reset_uid_sudo() {
+  // Let's change our uids now. We do keep capabilities though, since that's
+  // the point of the exercise. The first exec will reset both the keepcaps,
+  // and the capabilities in the child
+  std::string sudo_uid = getenv("SUDO_UID");
+  std::string sudo_gid = getenv("SUDO_GID");
+  assert(!sudo_uid.empty() && !sudo_gid.empty());
+  uid_t tracee_uid = stoi(sudo_uid);
+  gid_t tracee_gid = stoi(sudo_gid);
+  // Setuid will drop effective capabilities. Save them now and set them
+  // back after
+  struct NativeArch::cap_header header = {.version =
+                                              _LINUX_CAPABILITY_VERSION_3,
+                                          .pid = 0 };
+  struct NativeArch::cap_data data[2];
+  if (syscall(NativeArch::capget, &header, data) != 0) {
+    FATAL() << "FAILED to read capabilities";
+  }
+  if (prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0)) {
+    FATAL() << "FAILED to set keepcaps";
+  }
+  if (setgid(tracee_gid) != 0) {
+    FATAL() << "FAILED to setgid to sudo group";
+  }
+  if (setuid(tracee_uid) != 0) {
+    FATAL() << "FAILED to setuid to sudo user";
+  }
+  if (syscall(NativeArch::capset, &header, data) != 0) {
+    FATAL() << "FAILED to set capabilities";
+  }
+  // Just make sure the ambient set is cleared, to avoid polluting the tracee
+  prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+}
+
+int RecordCommand::run(vector<string>& args) {
   RecordFlags flags;
   while (parse_record_arg(args, flags)) {
+  }
+
+  if (running_under_rr()) {
+    if (flags.ignore_nested) {
+      exec_child(args);
+    }
+    fprintf(stderr, "rr: cannot run rr recording under rr. Exiting.\n"
+                    "Use `rr record --ignore-nested` to start the child "
+                    "process directly.\n");
+    return 1;
   }
 
   if (!verify_not_option(args) || args.size() == 0) {
@@ -241,5 +448,35 @@ int RecordCommand::run(std::vector<std::string>& args) {
   assert_prerequisites(flags.use_syscall_buffer);
   check_performance_settings();
 
-  return record(args, flags);
+  if (flags.setuid_sudo) {
+    if (geteuid() != 0 || getenv("SUDO_UID") == NULL) {
+      fprintf(stderr, "rr: --setuid-sudo option may only be used under sudo.\n"
+                      "Re-run as `sudo -EP rr record --setuid-sudo` to"
+                      "record privileged executables.\n");
+      return 1;
+    }
+
+    reset_uid_sudo();
+  }
+
+  WaitStatus status = record(args, flags);
+
+  // Everything should have been cleaned up by now.
+  check_for_leaks();
+
+  switch (status.type()) {
+    case WaitStatus::EXIT:
+      return status.exit_code();
+    case WaitStatus::FATAL_SIGNAL:
+      signal(status.fatal_sig(), SIG_DFL);
+      prctl(PR_SET_DUMPABLE, 0);
+      kill(getpid(), status.fatal_sig());
+      break;
+    default:
+      FATAL() << "Don't know why we exited: " << status;
+      break;
+  }
+  return 1;
 }
+
+} // namespace rr

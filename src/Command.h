@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+namespace rr {
+
 class TraceReader;
 
 enum OptionParameters { NO_PARAMETER, HAS_PARAMETER };
@@ -24,6 +26,7 @@ struct OptionSpec {
 };
 struct ParsedOption {
   char short_name;
+  std::string arg;
   std::string value;
   int64_t int_value;
   bool verify_valid_int(int64_t min = INT64_MIN + 1,
@@ -51,18 +54,21 @@ public:
                            ParsedOption* out);
   template <size_t N>
   static bool parse_option(std::vector<std::string>& args,
-                           const OptionSpec(&option_specs)[N],
+                           const OptionSpec (&option_specs)[N],
                            ParsedOption* out) {
     return parse_option(args, option_specs, N, out);
   }
 
 protected:
   Command(const char* name, const char* help);
+  virtual ~Command() {}
 
   static bool less_than_by_name(Command* c1, Command* c2);
 
   const char* name;
   const char* help;
 };
+
+} // namespace rr
 
 #endif // RR_COMMAND_H_

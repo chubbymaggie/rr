@@ -1,7 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "EmuFs"
-
 #include "EmuFs.h"
 
 #include <syscall.h>
@@ -10,13 +8,15 @@
 #include <sstream>
 #include <string>
 
+#include "AddressSpace.h"
+#include "ReplaySession.h"
 #include "kernel_abi.h"
 #include "kernel_metadata.h"
 #include "log.h"
-#include "ReplaySession.h"
 
-using namespace rr;
 using namespace std;
+
+namespace rr {
 
 static void replace_char(string& s, char c, char replacement) {
   size_t i;
@@ -27,15 +27,34 @@ static void replace_char(string& s, char c, char replacement) {
 
 EmuFile::~EmuFile() {
   LOG(debug) << "    EmuFs::~File(einode:" << inode_ << ")";
+  owner.destroyed_file(*this);
 }
 
-EmuFile::shr_ptr EmuFile::clone() {
-  auto f = EmuFile::create(orig_path.c_str(), device(), inode(), size_);
-  // NB: this isn't the most efficient possible file copy, but
-  // it's simple and not too slow.
-  ifstream src(proc_path(), ifstream::binary);
-  ofstream dst(f->proc_path(), ofstream::binary);
-  dst << src.rdbuf();
+EmuFile::shr_ptr EmuFile::clone(EmuFs& owner) {
+  auto f = EmuFile::create(owner, orig_path.c_str(), device(), inode(), size_);
+
+  uint64_t data[65536 / sizeof(uint64_t)];
+  uint64_t offset = 0;
+  while (offset < size_) {
+    ssize_t amount = min<uint64_t>(size_ - offset, sizeof(data));
+    ssize_t ret = pread64(fd(), data, amount, offset);
+    if (ret <= 0) {
+      FATAL() << "Couldn't read all the data";
+    }
+    // There could have been a short read
+    amount = ret;
+    uint8_t* data_ptr = reinterpret_cast<uint8_t*>(data);
+    while (amount > 0) {
+      ret = pwrite64(f->fd(), data_ptr, amount, offset);
+      if (ret <= 0) {
+        FATAL() << "Couldn't write all the data";
+      }
+      amount -= ret;
+      data_ptr += ret;
+      offset += ret;
+    }
+  }
+
   return f;
 }
 
@@ -53,7 +72,15 @@ void EmuFile::update(dev_t device, ino_t inode, uint64_t size) {
   size_ = size;
 }
 
-/*static*/ EmuFile::shr_ptr EmuFile::create(const string& orig_path,
+void EmuFile::ensure_size(uint64_t size) {
+  if (size_ < size) {
+    resize_shmem_segment(file, size);
+    size_ = size;
+  }
+}
+
+/*static*/ EmuFile::shr_ptr EmuFile::create(EmuFs& owner,
+                                            const string& orig_path,
                                             dev_t orig_device, ino_t orig_inode,
                                             uint64_t orig_file_size) {
   // Sanitize the mapped file path so that we can use it in a
@@ -62,7 +89,7 @@ void EmuFile::update(dev_t device, ino_t inode, uint64_t size) {
   replace_char(path_tag, '/', '\\');
 
   stringstream name;
-  name << SHMEM_FS << "/rr-emufs-" << getpid() << "-dev-" << orig_device
+  name << tmp_dir() << "/rr-emufs-" << getpid() << "-dev-" << orig_device
        << "-inode-" << orig_inode << "-" << path_tag;
   string real_name = name.str().substr(0, 255);
 
@@ -76,7 +103,7 @@ void EmuFile::update(dev_t device, ino_t inode, uint64_t size) {
   unlink(real_name.c_str());
   resize_shmem_segment(fd, orig_file_size);
 
-  shr_ptr f(new EmuFile(std::move(fd), orig_path, real_name, orig_device,
+  shr_ptr f(new EmuFile(owner, std::move(fd), orig_path, real_name, orig_device,
                         orig_inode, orig_file_size));
 
   LOG(debug) << "created emulated file for " << orig_path << " as "
@@ -84,89 +111,30 @@ void EmuFile::update(dev_t device, ino_t inode, uint64_t size) {
   return f;
 }
 
-EmuFile::EmuFile(ScopedFd&& fd, const string& orig_path,
+EmuFile::EmuFile(EmuFs& owner, ScopedFd&& fd, const string& orig_path,
                  const string& real_path, dev_t orig_device, ino_t orig_inode,
                  uint64_t orig_file_size)
     : orig_path(orig_path),
       tmp_path(real_path),
       file(std::move(fd)),
+      owner(owner),
       size_(orig_file_size),
       device_(orig_device),
-      inode_(orig_inode),
-      is_marked(false) {}
+      inode_(orig_inode) {}
 
 EmuFile::shr_ptr EmuFs::at(const KernelMapping& recorded_map) const {
-  return files.at(FileId(recorded_map));
+  return files.at(FileId(recorded_map)).lock();
 }
 
 bool EmuFs::has_file_for(const KernelMapping& recorded_map) const {
   return files.find(FileId(recorded_map)) != files.end();
 }
 
-EmuFs::shr_ptr EmuFs::clone() {
-  shr_ptr fs(new EmuFs());
-  for (auto& kv : files) {
-    const FileId& id = kv.first;
-    fs->files[id] = kv.second->clone();
-  }
-  return fs;
-}
-
-void EmuFs::gc(const Session& session) {
-  // XXX this implementation is unnecessarily slow.  But before
-  // throwing it away for something different, give it another
-  // shot once rr is caching local mmaps for all address spaces,
-  // which obviates the need for the yuck slow maps parsing
-  // here.
-  LOG(debug) << "Beginning emufs gc of " << files.size() << " files";
-
-  // Mark in-use files by iterating through the mmaps of all
-  // tracee address spaces.
-  //
-  // We inject these maps into the tracee and are careful to
-  // close the injected fd after we finish the mmap.  That means
-  // that the only way tracees can hold a reference to the
-  // underlying inode is through a memory mapping.  So to
-  // determine if a file is in use, we only have to find a
-  // recognizable filename in some tracee's memory map.
-  //
-  // We check *all* tracee file tables because tracees can share
-  // fds with each other in many ways, and we don't attempt to
-  // track any of that.
-  //
-  // TODO: assuming AddressSpace == FileTable, but technically
-  // they're different things: two tracees could share an
-  // address space but have different file tables.
-  size_t nr_marked_files = 0;
-  for (auto& as : session.vms()) {
-    Task* t = *as->task_set().begin();
-    LOG(debug) << "  iterating /proc/" << t->tid << "/maps ...";
-
-    mark_used_vfiles(*as, &nr_marked_files);
-    if (files.size() == nr_marked_files) {
-      break;
-    }
-  }
-
-  // Sweep all the virtual files that weren't marked.  It might
-  // be possible that a later task will mmap the same underlying
-  // file that we're about to destroy.  That's perfectly fine;
-  // we'll just create it anew, and restore its addressible
-  // contents from the snapshot saved to the trace.  Since there
-  // are no live references to the file in the interim, tracees
-  // can't observe the destroy/recreate operation.
-  vector<FileId> garbage;
-  for (auto it = files.begin(); it != files.end(); ++it) {
-    if (!it->second->marked()) {
-      garbage.push_back(it->first);
-    }
-    it->second->unmark();
-  }
-  for (auto it = garbage.begin(); it != garbage.end(); ++it) {
-    LOG(debug) << "  emufs gc reclaiming einode:" << it->inode << "; fs name `"
-               << files[*it]->emu_path() << "'";
-    files.erase(*it);
-  }
+EmuFile::shr_ptr EmuFs::clone_file(EmuFile::shr_ptr file) {
+  assert(file);
+  auto c = file->clone(*this);
+  files[FileId(*file)] = c;
+  return c;
 }
 
 EmuFile::shr_ptr EmuFs::get_or_create(const KernelMapping& recorded_km,
@@ -174,10 +142,11 @@ EmuFile::shr_ptr EmuFs::get_or_create(const KernelMapping& recorded_km,
   FileId id(recorded_km);
   auto it = files.find(id);
   if (it != files.end()) {
-    it->second->update(recorded_km.device(), recorded_km.inode(), file_size);
-    return it->second;
+    it->second.lock()->update(recorded_km.device(), recorded_km.inode(),
+                              file_size);
+    return it->second.lock();
   }
-  auto vf = EmuFile::create(recorded_km.fsname(), recorded_km.device(),
+  auto vf = EmuFile::create(*this, recorded_km.fsname(), recorded_km.device(),
                             recorded_km.inode(), file_size);
   files[id] = vf;
   return vf;
@@ -186,7 +155,7 @@ EmuFile::shr_ptr EmuFs::get_or_create(const KernelMapping& recorded_km,
 void EmuFs::log() const {
   LOG(error) << "EmuFs " << this << " with " << files.size() << " files:";
   for (auto& kv : files) {
-    auto file = kv.second;
+    auto file = kv.second.lock();
     LOG(error) << "  " << file->emu_path();
   }
 }
@@ -195,26 +164,7 @@ void EmuFs::log() const {
 
 EmuFs::EmuFs() {}
 
-void EmuFs::mark_used_vfiles(const AddressSpace& as, size_t* nr_marked_files) {
-  for (auto m : as.maps()) {
-    LOG(debug) << "  examining " << m.map.fsname().c_str() << " ...";
+EmuFs::FileId::FileId(const KernelMapping& recorded_map)
+    : device(recorded_map.device()), inode(recorded_map.inode()) {}
 
-    FileId id(m.recorded_map);
-    auto id_ef = files.find(id);
-    if (id_ef == files.end()) {
-      // Mapping isn't relevant. Not all shared mappings get EmuFs entries
-      // (e.g. readonly shared mappings of certain system files, like fonts).
-      continue;
-    }
-    auto ef = id_ef->second;
-    if (!ef->marked()) {
-      ef->mark();
-      LOG(debug) << "    marked einode:" << id.inode;
-      ++*nr_marked_files;
-      if (files.size() == *nr_marked_files) {
-        LOG(debug) << "  (marked all files, bailing)";
-        return;
-      }
-    }
-  }
-}
+} // namespace rr

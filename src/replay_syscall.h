@@ -5,25 +5,33 @@
 
 #include "TraceStream.h"
 
-class Task;
+namespace rr {
+
+class ReplayTask;
 struct ReplayTraceStep;
 
 /**
- * Call this when |t| has just entered a syscall.  At this point, data
- * saved at |rec_before_record_syscall_entry()| can be restored.
- */
-void rep_after_enter_syscall(Task* t, int syscallno);
-
-/**
- * Process pending syscall. Call this when |t| is about to enter or exit
+ * Prepare for a pending syscall. Call this when |t| is going to run towards
  * a syscall.
  */
-void rep_process_syscall(Task* t, ReplayTraceStep* step);
+void rep_prepare_run_to_syscall(ReplayTask* t, ReplayTraceStep* step);
+
+/**
+ * Call this when |t| has just entered a syscall.
+ */
+void rep_after_enter_syscall(ReplayTask* t);
+
+/**
+ * Process pending syscall. Call this when |t| is about to exit a syscall.
+ */
+void rep_process_syscall(ReplayTask* t, ReplayTraceStep* step);
 
 /**
  * Process an EV_GROW_MAP event. These are like mmap syscalls, so handled
  * in replay_syscall.
  */
-void process_grow_map(Task* t);
+void process_grow_map(ReplayTask* t);
+
+} // namespace rr
 
 #endif /* RR_REP_PROCESS_EVENT_H_ */

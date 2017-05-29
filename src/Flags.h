@@ -11,6 +11,8 @@
 #include "Ticks.h"
 #include "TraceFrame.h"
 
+namespace rr {
+
 /**
  * Command line arguments for rr
  */
@@ -22,17 +24,16 @@ struct Flags {
    */
   int checksum;
 
-  enum { DUMP_ON_ALL = 10000, DUMP_ON_NONE = -DUMP_ON_ALL };
-  /* event(s) to create memory dumps for */
-  TraceFrame::Time dump_on; // event
+  enum {
+    DUMP_ON_ALL = 10000,
+    DUMP_ON_RDTSC = 10001,
+    DUMP_ON_NONE = -DUMP_ON_ALL
+  };
+  int dump_on;
 
   enum { DUMP_AT_NONE = -1 };
   /* time at which to create memory dump */
   int dump_at; // global time
-
-  /* True when not-absolutely-urgently-critical messages will be
-   * logged. */
-  bool verbose;
 
   // Force rr to do some things that it otherwise wouldn't, for
   // example launching an emergency debugger when the output
@@ -61,7 +62,6 @@ struct Flags {
       : checksum(CHECKSUM_NONE),
         dump_on(DUMP_ON_NONE),
         dump_at(DUMP_AT_NONE),
-        verbose(false),
         force_things(false),
         mark_stdio(false),
         check_cached_mmaps(false),
@@ -78,5 +78,7 @@ struct Flags {
 private:
   static Flags singleton;
 };
+
+} // namespace rr
 
 #endif /* RR_FLAGS_H_ */

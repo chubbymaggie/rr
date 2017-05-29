@@ -1,11 +1,21 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "TraceFrame"
-
 #include "TraceFrame.h"
 
 #include <assert.h>
 #include <inttypes.h>
+
+#include "util.h"
+
+namespace rr {
+
+TraceFrame::TraceFrame(Time global_time, pid_t tid, const Event& event,
+                       Ticks tick_count, double monotonic_time)
+    : global_time(global_time),
+      tid_(tid),
+      ev(event),
+      ticks_(tick_count),
+      monotonic_time_(monotonic_time ? monotonic_time : monotonic_now_sec()) {}
 
 void TraceFrame::set_exec_info(const Registers& regs,
                                const PerfCounters::Extra* extra_perf_values,
@@ -23,8 +33,8 @@ void TraceFrame::set_exec_info(const Registers& regs,
 void TraceFrame::dump(FILE* out) const {
   out = out ? out : stdout;
 
-  fprintf(out, "{\n  global_time:%u, event:`%s' ", time(),
-          event().str().c_str());
+  fprintf(out, "{\n  real_time:%f global_time:%u, event:`%s' ",
+          monotonic_time(), time(), event().str().c_str());
   if (event().is_syscall_event()) {
     fprintf(out, "(state:%s) ", state_name(event().Syscall().state));
   }
@@ -38,7 +48,11 @@ void TraceFrame::dump(FILE* out) const {
             extra_perf.hw_interrupts, extra_perf.page_faults,
             extra_perf.instructions_retired);
   }
-  regs().print_register_file_for_trace(out);
+  regs().print_register_file_compact(out);
+  if (recorded_extra_regs.format() != ExtraRegisters::NONE) {
+    fputc(' ', out);
+    recorded_extra_regs.print_register_file_compact(out);
+  }
   fprintf(out, "\n");
 }
 
@@ -57,3 +71,5 @@ void TraceFrame::dump_raw(FILE* out) const {
   regs().print_register_file_for_trace_raw(out);
   fprintf(out, "\n");
 }
+
+} // namespace rr

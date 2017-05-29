@@ -12,7 +12,11 @@
 #include "BreakpointCondition.h"
 #include "Registers.h"
 #include "ReplaySession.h"
+#include "ReplayTask.h"
+#include "ReturnAddressList.h"
 #include "TraceFrame.h"
+
+namespace rr {
 
 enum RunDirection { RUN_FORWARD, RUN_BACKWARD };
 
@@ -61,10 +65,10 @@ public:
     /**
      * Return the values of the general-purpose registers at this mark.
      */
-    const Registers& regs() const { return ptr->regs; }
+    const Registers& regs() const { return ptr->proto.regs; }
     const ExtraRegisters& extra_regs() const { return ptr->extra_regs; }
 
-    TraceFrame::Time time() const { return ptr->key.trace_time; }
+    TraceFrame::Time time() const { return ptr->proto.key.trace_time; }
 
   private:
     friend class ReplayTimeline;
@@ -128,21 +132,21 @@ public:
   // Likewise only one watchpoint for a given task/addr/num_bytes/type can be
   // set. gdb expects that setting two breakpoints on the same address and then
   // removing one removes both.
-  bool add_breakpoint(Task* t, remote_code_ptr addr,
+  bool add_breakpoint(ReplayTask* t, remote_code_ptr addr,
                       std::unique_ptr<BreakpointCondition> condition = nullptr);
   // You can't remove a breakpoint with a specific condition, so don't
   // place multiple breakpoints with conditions on the same location.
-  void remove_breakpoint(Task* t, remote_code_ptr addr);
-  bool add_watchpoint(Task* t, remote_ptr<void> addr, size_t num_bytes,
+  void remove_breakpoint(ReplayTask* t, remote_code_ptr addr);
+  bool add_watchpoint(ReplayTask* t, remote_ptr<void> addr, size_t num_bytes,
                       WatchType type,
                       std::unique_ptr<BreakpointCondition> condition = nullptr);
   // You can't remove a watchpoint with a specific condition, so don't
   // place multiple breakpoints with conditions on the same location.
-  void remove_watchpoint(Task* t, remote_ptr<void> addr, size_t num_bytes,
+  void remove_watchpoint(ReplayTask* t, remote_ptr<void> addr, size_t num_bytes,
                          WatchType type);
   void remove_breakpoints_and_watchpoints();
-  bool has_breakpoint_at_address(Task* t, remote_code_ptr addr);
-  bool has_watchpoint_at_address(Task* t, remote_ptr<void> addr,
+  bool has_breakpoint_at_address(ReplayTask* t, remote_code_ptr addr);
+  bool has_watchpoint_at_address(ReplayTask* t, remote_ptr<void> addr,
                                  size_t num_bytes, WatchType type);
 
   /**
@@ -195,11 +199,12 @@ public:
   ReplayResult replay_step_forward(RunCommand command,
                                    TraceFrame::Time stop_at_time);
 
-  ReplayResult reverse_continue(const std::function<bool(Task* t)>& stop_filter,
-                                const std::function<bool()>& interrupt_check);
+  ReplayResult reverse_continue(
+      const std::function<bool(ReplayTask* t)>& stop_filter,
+      const std::function<bool()>& interrupt_check);
   ReplayResult reverse_singlestep(
       const TaskUid& tuid, Ticks tuid_ticks,
-      const std::function<bool(Task* t)>& stop_filter,
+      const std::function<bool(ReplayTask* t)>& stop_filter,
       const std::function<bool()>& interrupt_check);
 
   /**
@@ -210,7 +215,7 @@ public:
    * Will only return a Mark for the same executing task as 'from', which
    * must be 't'.
    */
-  Mark lazy_reverse_singlestep(const Mark& from, Task* t);
+  Mark lazy_reverse_singlestep(const Mark& from, ReplayTask* t);
 
   /**
    * Different strategies for placing automatic checkpoints.
@@ -284,8 +289,9 @@ private:
    * All the information we'll need to construct a mark lazily.
    */
   struct ProtoMark {
-    ProtoMark(const MarkKey& key, Task* t)
-        : key(key), regs(t->regs()), return_addresses(t->return_addresses()) {}
+    ProtoMark(const MarkKey& key, ReplayTask* t)
+        : key(key), regs(t->regs()), return_addresses(ReturnAddressList(t)) {}
+    ProtoMark(const MarkKey& key) : key(key) {}
 
     bool equal_states(ReplaySession& session) const;
 
@@ -303,14 +309,13 @@ private:
     InternalMark(ReplayTimeline* owner, ReplaySession& session,
                  const MarkKey& key)
         : owner(owner),
-          key(key),
+          proto(key),
           ticks_at_event_start(session.ticks_at_start_of_current_event()),
           checkpoint_refcount(0),
           singlestep_to_next_mark_no_signal(false) {
-      Task* t = session.current_task();
+      ReplayTask* t = session.current_task();
       if (t) {
-        regs = t->regs();
-        return_addresses = t->return_addresses();
+        proto = ProtoMark(key, t);
         extra_regs = t->extra_regs();
       }
     }
@@ -321,10 +326,8 @@ private:
     bool equal_states(ReplaySession& session) const;
 
     ReplayTimeline* owner;
-    MarkKey key;
-    Registers regs;
+    ProtoMark proto;
     ExtraRegisters extra_regs;
-    ReturnAddressList return_addresses;
     ReplaySession::shr_ptr checkpoint;
     Ticks ticks_at_event_start;
     uint32_t checkpoint_refcount;
@@ -344,8 +347,11 @@ private:
    */
   void unapply_breakpoints_and_watchpoints();
 
+  void apply_breakpoints_internal();
+  void unapply_breakpoints_internal();
+
   static MarkKey session_mark_key(ReplaySession& session) {
-    Task* t = session.current_task();
+    ReplayTask* t = session.current_task();
     return MarkKey(session.trace_reader().time(), t ? t->tick_count() : 0,
                    session.current_step_key());
   }
@@ -389,7 +395,7 @@ private:
                                       const ReplayResult& result);
   ReplayResult reverse_singlestep(
       const Mark& origin, const TaskUid& step_tuid, Ticks step_ticks,
-      const std::function<bool(Task* t)>& stop_filter,
+      const std::function<bool(ReplayTask* t)>& stop_filter,
       const std::function<bool()>& interrupt_check);
 
   // Reasonably fast since it just relies on checking the mark map.
@@ -440,11 +446,11 @@ private:
    * For each MarkKey, the InternalMarks are stored in execution order.
    *
    * We assume there will be a limited number of InternalMarks per MarkKey.
-   * This should be true because Task::tick_count() should increment
+   * This should be true because ReplayTask::tick_count() should increment
    * frequently during execution. In some cases we see hundreds of elements
    * but that's not too bad.
    */
-  std::map<MarkKey, std::vector<std::shared_ptr<InternalMark> > > marks;
+  std::map<MarkKey, std::vector<std::shared_ptr<InternalMark>>> marks;
 
   /**
    * All mark keys with at least one checkpoint. The value is the number of
@@ -454,9 +460,11 @@ private:
   std::map<MarkKey, uint32_t> marks_with_checkpoints;
 
   std::set<std::tuple<AddressSpaceUid, remote_code_ptr,
-                      std::unique_ptr<BreakpointCondition> > > breakpoints;
+                      std::unique_ptr<BreakpointCondition>>>
+      breakpoints;
   std::set<std::tuple<AddressSpaceUid, remote_ptr<void>, size_t, WatchType,
-                      std::unique_ptr<BreakpointCondition> > > watchpoints;
+                      std::unique_ptr<BreakpointCondition>>>
+      watchpoints;
   bool breakpoints_applied;
 
   TraceFrame::Time reverse_execution_barrier_event;
@@ -482,5 +490,7 @@ private:
 };
 
 std::ostream& operator<<(std::ostream& s, const ReplayTimeline::Mark& o);
+
+} // namespace rr
 
 #endif // RR_REPLAY_TIMELINE_H_

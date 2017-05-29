@@ -6,30 +6,45 @@
 #define _GNU_SOURCE 1
 #define _POSIX_C_SOURCE 2
 
+/* btrfs needs NULL but doesn't #include it */
+#include <stdlib.h>
+/* need to include sys/mount.h before linux/fs.h */
+#include <sys/mount.h>
+
 #include <arpa/inet.h>
 #include <asm/prctl.h>
 #include <assert.h>
+#include <ctype.h>
 #include <dirent.h>
+#include <dlfcn.h>
+#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <inttypes.h>
 #include <linux/audit.h>
 #include <linux/capability.h>
 #include <linux/ethtool.h>
 #include <linux/filter.h>
+#include <linux/fs.h>
 #include <linux/futex.h>
 #include <linux/if.h>
+#include <linux/if_packet.h>
 #include <linux/limits.h>
+#include <linux/mtio.h>
 #include <linux/perf_event.h>
+#include <linux/personality.h>
 #include <linux/random.h>
 #include <linux/seccomp.h>
 #include <linux/sockios.h>
 #include <linux/unistd.h>
 #include <linux/videodev2.h>
 #include <linux/wireless.h>
+#include <mqueue.h>
 #include <poll.h>
 #include <pthread.h>
 #include <pty.h>
+#include <pwd.h>
 #include <sched.h>
 #include <signal.h>
 #include <sound/asound.h>
@@ -37,12 +52,13 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <syscall.h>
-#include <sys/file.h>
-#include <sys/xattr.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/fanotify.h>
+#include <sys/file.h>
+#include <sys/fsuid.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/ipc.h>
 #include <sys/mman.h>
@@ -60,9 +76,10 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
+#include <sys/sysmacros.h>
 #include <sys/time.h>
-#include <sys/times.h>
 #include <sys/timerfd.h>
+#include <sys/times.h>
 #include <sys/types.h>
 #include <sys/ucontext.h>
 #include <sys/uio.h>
@@ -71,6 +88,8 @@
 #include <sys/utsname.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
+#include <syscall.h>
 #include <termios.h>
 #include <time.h>
 #include <ucontext.h>
@@ -91,6 +110,18 @@
 typedef unsigned char uint8_t;
 
 #define ALEN(_a) (sizeof(_a) / sizeof(_a[0]))
+
+/**
+ * Allocate new memory of |size| in bytes. The pointer returned is never NULL.
+ * This calls aborts the program if the host runs out of memory.
+ */
+inline static void* xmalloc(size_t size) {
+  void* mem_ptr = malloc(size);
+  if (!mem_ptr) {
+    abort();
+  }
+  return mem_ptr;
+}
 
 /**
  * Print the printf-like arguments to stdout as atomic-ly as we can
@@ -150,39 +181,131 @@ inline static void check_data(void* buf, size_t len) {
  */
 inline static uint64_t rdtsc(void) { return __rdtsc(); }
 
+/**
+ * Perform some syscall that writes an event, i.e. is not syscall-buffered.
+ */
+inline static void event_syscall(void) { syscall(-1); }
+
 static uint64_t GUARD_VALUE = 0xdeadbeeff00dbaad;
 
+inline static size_t ceil_page_size(size_t size) {
+  size_t page_size = sysconf(_SC_PAGESIZE);
+  return (size + page_size - 1) & ~(page_size - 1);
+}
+
 /**
- * Allocate 'size' bytes, fill with 'value', and place canary values before
- * and after the allocated block.
+ * Allocate 'size' bytes, fill with 'value', place canary value before
+ * the allocated block, and put guard pages before and after. Ensure
+ * there's a guard page immediately after `size`.
+ * This lets us catch cases where too much data is being recorded --- which can
+ * cause errors if the recorder tries to read invalid memory.
  */
 inline static void* allocate_guard(size_t size, char value) {
-  char* cp =
-      (char*)malloc(size + 2 * sizeof(GUARD_VALUE)) + sizeof(GUARD_VALUE);
+  size_t page_size = sysconf(_SC_PAGESIZE);
+  size_t map_size = ceil_page_size(size + sizeof(GUARD_VALUE)) + 2 * page_size;
+  char* cp = (char*)mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+                         MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  test_assert(cp != MAP_FAILED);
+  /* create guard pages */
+  test_assert(munmap(cp, page_size) == 0);
+  test_assert(munmap(cp + map_size - page_size, page_size) == 0);
+  cp = cp + map_size - page_size - size;
   memcpy(cp - sizeof(GUARD_VALUE), &GUARD_VALUE, sizeof(GUARD_VALUE));
-  memcpy(cp + size, &GUARD_VALUE, sizeof(GUARD_VALUE));
   memset(cp, value, size);
   return cp;
 }
 
 /**
- * Verify that canary values before and after the block allocated at 'p'
- * (of size 'size') are still valid.
+ * Verify that canary value before the block allocated at 'p'
+ * (of size 'size') is still valid.
  */
-inline static void verify_guard(size_t size, void* p) {
+inline static void verify_guard(__attribute__((unused)) size_t size, void* p) {
   char* cp = (char*)p;
   test_assert(
       memcmp(cp - sizeof(GUARD_VALUE), &GUARD_VALUE, sizeof(GUARD_VALUE)) == 0);
-  test_assert(memcmp(cp + size, &GUARD_VALUE, sizeof(GUARD_VALUE)) == 0);
 }
 
 /**
- * Verify that canary values before and after the block allocated at 'p'
- * (of size 'size') are still valid, and free the block.
+ * Verify that canary value before the block allocated at 'p'
+ * (of size 'size') is still valid, and free the block.
  */
 inline static void free_guard(size_t size, void* p) {
   verify_guard(size, p);
-  free((char*)p - sizeof(GUARD_VALUE));
+  size_t page_size = sysconf(_SC_PAGESIZE);
+  size_t map_size = ceil_page_size(size + sizeof(GUARD_VALUE)) + 2 * page_size;
+  char* cp = (char*)p + size + page_size - map_size;
+  test_assert(0 == munmap(cp, map_size - 2 * page_size));
+}
+
+inline static void crash_null_deref(void) { *(volatile int*)NULL = 0; }
+
+static char* trim_leading_blanks(char* str) {
+  char* trimmed = str;
+  while (isblank(*trimmed)) {
+    ++trimmed;
+  }
+  return trimmed;
+}
+
+typedef struct map_properties {
+  uint64_t start, end, offset, inode;
+  int dev_major, dev_minor;
+  char flags[32];
+} map_properties_t;
+typedef void (*maps_callback)(uint64_t env, char* name,
+                              map_properties_t* props);
+inline static void iterate_maps(uint64_t env, maps_callback callback,
+                                FILE* maps_file) {
+  while (!feof(maps_file)) {
+    char line[PATH_MAX * 2];
+    if (!fgets(line, sizeof(line), maps_file)) {
+      break;
+    }
+
+    map_properties_t properties;
+    int chars_scanned;
+    int nparsed = sscanf(
+        line, "%" SCNx64 "-%" SCNx64 " %31s %" SCNx64 " %x:%x %" SCNu64 " %n",
+        &properties.start, &properties.end, properties.flags,
+        &properties.offset, &properties.dev_major, &properties.dev_minor,
+        &properties.inode, &chars_scanned);
+    assert(8 /*number of info fields*/ == nparsed ||
+           7 /*num fields if name is blank*/ == nparsed);
+
+    // trim trailing newline, if any
+    int last_char = strlen(line) - 1;
+    if (line[last_char] == '\n') {
+      line[last_char] = 0;
+    }
+    char* name = trim_leading_blanks(line + chars_scanned);
+
+    callback(env, name, &properties);
+  }
+}
+
+/**
+ * Represents syscall params.  Makes it simpler to pass them around,
+ * and avoids pushing/popping all the data for calls.
+ */
+struct syscall_info {
+  long no;
+  long args[6];
+};
+
+typedef void (*DelayedSyscall)(struct syscall_info* info);
+
+inline static void default_delayed_syscall(struct syscall_info* info) {
+  syscall(info->no, info->args[0], info->args[1], info->args[2], info->args[3],
+          info->args[4], info->args[5]);
+}
+
+/**
+ * Returns a function which will execute a syscall after spending a long time
+ * stuck in syscallbuf code doing nothing. Returns NULL
+ */
+inline static DelayedSyscall get_delayed_syscall(void) {
+  DelayedSyscall ret = (DelayedSyscall)dlsym(RTLD_DEFAULT, "delayed_syscall");
+  return ret ? ret : default_delayed_syscall;
 }
 
 #define ALLOCATE_GUARD(p, v) p = allocate_guard(sizeof(*p), v)
@@ -194,6 +317,51 @@ inline static void free_guard(size_t size, void* p) {
 #endif
 #ifndef SECCOMP_SET_MODE_FILTER
 #define SECCOMP_SET_MODE_FILTER 1
+#endif
+#ifndef SECCOMP_FILTER_FLAG_TSYNC
+#define SECCOMP_FILTER_FLAG_TSYNC 1
+#endif
+
+/* Old systems don't have linux/kcmp.h */
+#define RR_KCMP_FILE 0
+#define RR_KCMP_FILES 2
+
+/* Old systems don't have these */
+#ifndef TIOCGPKT
+#define TIOCGPKT _IOR('T', 0x38, int)
+#endif
+#ifndef TIOCGPTLCK
+#define TIOCGPTLCK _IOR('T', 0x39, int)
+#endif
+#ifndef TIOCGEXCL
+#define TIOCGEXCL _IOR('T', 0x40, int)
+#endif
+
+#ifndef MADV_FREE
+#define MADV_FREE 8
+#endif
+
+#ifndef F_OFD_GETLK
+#define F_OFD_GETLK 36
+#endif
+#ifndef F_OFD_SETLK
+#define F_OFD_SETLK 37
+#endif
+
+#ifndef PR_CAP_AMBIENT
+#define PR_CAP_AMBIENT 47
+#endif
+#ifndef PR_CAP_AMBIENT_IS_SET
+#define PR_CAP_AMBIENT_IS_SET 1
+#endif
+#ifndef PR_CAP_AMBIENT_RAISE
+#define PR_CAP_AMBIENT_RAISE 2
+#endif
+#ifndef PR_CAP_AMBIENT_LOWER
+#define PR_CAP_AMBIENT_LOWER 3
+#endif
+#ifndef PR_CAP_AMBIENT_CLEAR_ALL
+#define PR_CAP_AMBIENT_CLEAR_ALL 4
 #endif
 
 #endif /* RRUTIL_H */

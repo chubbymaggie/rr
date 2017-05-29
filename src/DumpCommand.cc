@@ -9,16 +9,18 @@
 
 #include "AddressSpace.h"
 #include "Command.h"
+#include "TraceStream.h"
 #include "kernel_metadata.h"
 #include "main.h"
-#include "TraceStream.h"
 #include "util.h"
 
 using namespace std;
 
+namespace rr {
+
 class DumpCommand : public Command {
 public:
-  virtual int run(std::vector<std::string>& args);
+  virtual int run(vector<string>& args) override;
 
 protected:
   DumpCommand(const char* name, const char* help) : Command(name, help) {}
@@ -32,39 +34,48 @@ DumpCommand DumpCommand::singleton(
     "  Event specs can be either an event number like `127', or a range\n"
     "  like `1000-5000'.  By default, all events are dumped.\n"
     "  -b, --syscallbuf           dump syscallbuf contents\n"
+    " --g, --generic              dump generic data\n"
     "  -m, --recorded-metadata    dump recorded data metadata\n"
     "  -p, --mmaps                dump mmap data\n"
     "  -r, --raw                  dump trace frames in a more easily\n"
     "                             machine-parseable format instead of the\n"
     "                             default human-readable format\n"
-    "  -s, --statistics           dump statistics about the trace\n");
+    "  -s, --statistics           dump statistics about the trace\n"
+    "  -t, --tid=<pid>            dump events only for the specified tid\n");
 
 struct DumpFlags {
   bool dump_syscallbuf;
+  bool dump_generic;
   bool dump_recorded_data_metadata;
   bool dump_mmaps;
   bool raw_dump;
   bool dump_statistics;
+  int only_tid;
 
   DumpFlags()
       : dump_syscallbuf(false),
+        dump_generic(false),
         dump_recorded_data_metadata(false),
         dump_mmaps(false),
         raw_dump(false),
-        dump_statistics(false) {}
+        dump_statistics(false),
+        only_tid(0) {}
 };
 
-static bool parse_dump_arg(std::vector<std::string>& args, DumpFlags& flags) {
+static bool parse_dump_arg(vector<string>& args, DumpFlags& flags) {
   if (parse_global_option(args)) {
     return true;
   }
 
-  static const OptionSpec options[] = { { 'b', "syscallbuf", NO_PARAMETER },
-                                        { 'm', "recorded-metadata",
-                                          NO_PARAMETER },
-                                        { 'p', "mmaps", NO_PARAMETER },
-                                        { 'r', "raw", NO_PARAMETER },
-                                        { 's', "statistics", NO_PARAMETER } };
+  static const OptionSpec options[] = {
+    { 'b', "syscallbuf", NO_PARAMETER },
+    { 'g', "generic", NO_PARAMETER },
+    { 'm', "recorded-metadata", NO_PARAMETER },
+    { 'p', "mmaps", NO_PARAMETER },
+    { 'r', "raw", NO_PARAMETER },
+    { 's', "statistics", NO_PARAMETER },
+    { 't', "tid", HAS_PARAMETER },
+  };
   ParsedOption opt;
   if (!Command::parse_option(args, options, &opt)) {
     return false;
@@ -73,6 +84,9 @@ static bool parse_dump_arg(std::vector<std::string>& args, DumpFlags& flags) {
   switch (opt.short_name) {
     case 'b':
       flags.dump_syscallbuf = true;
+      break;
+    case 'g':
+      flags.dump_generic = true;
       break;
     case 'm':
       flags.dump_recorded_data_metadata = true;
@@ -85,6 +99,12 @@ static bool parse_dump_arg(std::vector<std::string>& args, DumpFlags& flags) {
       break;
     case 's':
       flags.dump_statistics = true;
+      break;
+    case 't':
+      if (!opt.verify_valid_int(1, INT32_MAX)) {
+        return false;
+      }
+      flags.only_tid = opt.int_value;
       break;
     default:
       assert(0 && "Unknown option");
@@ -102,7 +122,7 @@ static void dump_syscallbuf_data(TraceReader& trace, FILE* out,
   auto flush_hdr = reinterpret_cast<const syscallbuf_hdr*>(buf.data.data());
   if (flush_hdr->num_rec_bytes > bytes_remaining) {
     fprintf(stderr, "Malformed trace file (bad recorded-bytes count)\n");
-    abort();
+    notifying_abort();
   }
   bytes_remaining = flush_hdr->num_rec_bytes;
 
@@ -115,7 +135,7 @@ static void dump_syscallbuf_data(TraceReader& trace, FILE* out,
             (long)record->ret, (long)record->size);
     if (record->size < sizeof(*record)) {
       fprintf(stderr, "Malformed trace file (bad record size)\n");
-      abort();
+      notifying_abort();
     }
     record_ptr += stored_record_size(record->size);
   }
@@ -152,7 +172,8 @@ static void dump_events_matching(TraceReader& trace, const DumpFlags& flags,
     if (end < frame.time()) {
       return;
     }
-    if (start <= frame.time() && frame.time() <= end) {
+    if (start <= frame.time() && frame.time() <= end &&
+        (!flags.only_tid || flags.only_tid == frame.tid())) {
       if (flags.raw_dump) {
         frame.dump_raw(out);
       } else {
@@ -165,7 +186,8 @@ static void dump_events_matching(TraceReader& trace, const DumpFlags& flags,
       while (true) {
         TraceReader::MappedData data;
         bool found;
-        KernelMapping km = trace.read_mapped_region(&data, &found);
+        KernelMapping km =
+            trace.read_mapped_region(&data, &found, TraceReader::DONT_VALIDATE);
         if (!found) {
           break;
         }
@@ -183,20 +205,32 @@ static void dump_events_matching(TraceReader& trace, const DumpFlags& flags,
           if (km.flags() & MAP_SHARED) {
             prot_flags[3] = 's';
           }
+          const char* fsname = km.fsname().c_str();
+          if (data.source == TraceReader::SOURCE_ZERO) {
+            const char source_zero[] = "<ZERO>";
+            fsname = source_zero;
+          }
           fprintf(out, "  { map_file:\"%s\", addr:%p, length:%p, "
-                       "prot_flags:\"%s\", file_offset:0x%llx }\n",
-                  km.fsname().c_str(), (void*)km.start().as_int(),
-                  (void*)km.size(), prot_flags,
-                  (long long)km.file_offset_bytes());
+                       "prot_flags:\"%s\", file_offset:0x%llx, "
+                       "data_file:\"%s\", data_offset:0x%llx, "
+                       "file_size:0x%llx }\n",
+                  fsname, (void*)km.start().as_int(), (void*)km.size(),
+                  prot_flags, (long long)km.file_offset_bytes(),
+                  data.file_name.c_str(), (long long)data.data_offset_bytes,
+                  (long long)data.file_size_bytes);
         }
       }
 
       TraceReader::RawData data;
       while (process_raw_data && trace.read_raw_data_for_frame(frame, data)) {
         if (flags.dump_recorded_data_metadata) {
-          fprintf(out, "  { addr:%p, length:%p }\n", (void*)data.addr.as_int(),
-                  (void*)data.data.size());
+          fprintf(out, "  { tid:%d, addr:%p, length:%p }\n", data.rec_tid,
+                  (void*)data.addr.as_int(), (void*)data.data.size());
         }
+      }
+      vector<uint8_t> buf;
+      while (flags.dump_generic && trace.read_generic_for_frame(frame, buf)) {
+        fprintf(out, "  { length:%p }\n", (void*)buf.size());
       }
       if (!flags.raw_dump) {
         fprintf(out, "}\n");
@@ -207,7 +241,8 @@ static void dump_events_matching(TraceReader& trace, const DumpFlags& flags,
       }
       while (true) {
         TraceReader::MappedData data;
-        KernelMapping km = trace.read_mapped_region(&data);
+        KernelMapping km = trace.read_mapped_region(&data, nullptr,
+                                                    TraceReader::DONT_VALIDATE);
         if (km.size() == 0) {
           break;
         }
@@ -248,7 +283,7 @@ static void dump(const string& trace_dir, const DumpFlags& flags,
   }
 }
 
-int DumpCommand::run(std::vector<std::string>& args) {
+int DumpCommand::run(vector<string>& args) {
   DumpFlags flags;
 
   while (parse_dump_arg(args, flags)) {
@@ -263,3 +298,5 @@ int DumpCommand::run(std::vector<std::string>& args) {
   dump(trace_dir, flags, args, stdout);
   return 0;
 }
+
+} // namespace rr

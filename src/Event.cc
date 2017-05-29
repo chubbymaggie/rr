@@ -1,7 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "Event"
-
 #include "Event.h"
 
 #include <syscall.h>
@@ -11,12 +9,15 @@
 
 #include "preload/preload_interface.h"
 
+#include "Task.h"
 #include "kernel_abi.h"
 #include "kernel_metadata.h"
 #include "log.h"
+#include "util.h"
 
-using namespace rr;
 using namespace std;
+
+namespace rr {
 
 Event::Event(EncodedEvent e) {
   switch (event_type = e.type) {
@@ -51,8 +52,9 @@ Event::Event(EncodedEvent e) {
       return;
 
     case EV_SYSCALL:
-      new (&Syscall()) SyscallEvent(e.data, e.arch());
-      Syscall().state = e.is_syscall_entry ? ENTERING_SYSCALL : EXITING_SYSCALL;
+      new (&Syscall()) SyscallEvent(e.data >> 3, e.arch());
+      Syscall().state = SyscallState((e.data & 0x3) + 1);
+      Syscall().failed_during_preparation = (e.data & 0x4) != 0;
       return;
 
     default:
@@ -133,10 +135,6 @@ EncodedEvent Event::encode() const {
   e.type = event_type;
   e.has_exec_info = has_exec_info();
   e.arch_ = arch();
-  // Arbitrarily designate events for which this isn't
-  // meaningful as being at "entry".  The events for which this
-  // is meaningful set it below.
-  e.is_syscall_entry = true;
 
   switch (event_type) {
     case EV_SEGV_RDTSC:
@@ -168,11 +166,17 @@ EncodedEvent Event::encode() const {
     case EV_SYSCALL: {
       // PROCESSING_SYSCALL is a transient state that we
       // should never attempt to record.
-      assert(Syscall().state != PROCESSING_SYSCALL);
-      set_encoded_event_data(
-          &e, Syscall().is_restart ? syscall_number_for_restart_syscall(e.arch_)
-                                   : Syscall().number);
-      e.is_syscall_entry = Syscall().state == ENTERING_SYSCALL;
+      assert(Syscall().state != PROCESSING_SYSCALL &&
+             Syscall().state != NO_SYSCALL);
+      int data =
+          (Syscall().is_restart ? syscall_number_for_restart_syscall(e.arch_)
+                                : Syscall().number)
+          << 3;
+      data |= (int)Syscall().state - 1;
+      if (Syscall().failed_during_preparation) {
+        data |= 0x4;
+      }
+      set_encoded_event_data(&e, data);
       return e;
     }
 
@@ -297,10 +301,11 @@ std::string Event::type_name() const {
   }
 }
 
-SignalEvent::SignalEvent(const siginfo_t& siginfo, SupportedArch arch)
-    : BaseEvent(HAS_EXEC_INFO, arch),
+SignalEvent::SignalEvent(const siginfo_t& siginfo,
+                         SignalDeterministic deterministic, Task* t)
+    : BaseEvent(HAS_EXEC_INFO, t->arch()),
       siginfo(siginfo),
-      deterministic(is_deterministic_signal(siginfo)) {}
+      deterministic(deterministic) {}
 
 const char* state_name(SyscallState state) {
   switch (state) {
@@ -308,6 +313,7 @@ const char* state_name(SyscallState state) {
   case _id:                                                                    \
     return #_id
     CASE(NO_SYSCALL);
+    CASE(ENTERING_SYSCALL_PTRACE);
     CASE(ENTERING_SYSCALL);
     CASE(PROCESSING_SYSCALL);
     CASE(EXITING_SYSCALL);
@@ -316,3 +322,5 @@ const char* state_name(SyscallState state) {
       return "???state";
   }
 }
+
+} // namespace rr

@@ -9,8 +9,13 @@
 #include "Scheduler.h"
 #include "SeccompFilterRewriter.h"
 #include "Session.h"
-#include "task.h"
+#include "TaskGroup.h"
 #include "TraceFrame.h"
+#include "WaitStatus.h"
+
+namespace rr {
+
+class RecordTask;
 
 /** Encapsulates additional session state related to recording. */
 class RecordSession : public Session {
@@ -21,32 +26,42 @@ public:
    * Create a recording session for the initial command line |argv|.
    */
   enum SyscallBuffering { ENABLE_SYSCALL_BUF, DISABLE_SYSCALL_BUF };
-  enum BindCPU { BIND_CPU, UNBOUND_CPU };
-  enum Chaos { ENABLE_CHAOS, DISABLE_CHAOS };
+  /**
+   * BIND_CPU means binding to a randomly chosen CPU.
+   * UNBOUND_CPU means not binding to a particular CPU.
+   * A non-negative value means binding to the specific CPU number.
+   */
+  enum BindCPU { BIND_CPU = -2, UNBOUND_CPU = -1 };
   static shr_ptr create(
       const std::vector<std::string>& argv,
       const std::vector<std::string>& extra_env = std::vector<std::string>(),
       SyscallBuffering syscallbuf = ENABLE_SYSCALL_BUF,
-      BindCPU bind_cpu = BIND_CPU, Chaos chaos = DISABLE_CHAOS);
+      int bind_cpu = BIND_CPU);
 
   bool use_syscall_buffer() const { return use_syscall_buffer_; }
-  void set_ignore_sig(int ignore_sig) { this->ignore_sig = ignore_sig; }
+  size_t syscall_buffer_size() const { return syscall_buffer_size_; }
+  bool use_read_cloning() const { return use_read_cloning_; }
+  bool use_file_cloning() const { return use_file_cloning_; }
+  void set_ignore_sig(int sig) { ignore_sig = sig; }
   int get_ignore_sig() const { return ignore_sig; }
+  void set_continue_through_sig(int sig) { continue_through_sig = sig; }
+  int get_continue_through_sig() const { return continue_through_sig; }
 
   enum RecordStatus {
     // Some execution was recorded. record_step() can be called again.
     STEP_CONTINUE,
     // All tracees are dead. record_step() should not be called again.
     STEP_EXITED,
-    // Initial exec of the tracee failed.
-    STEP_EXEC_FAILED,
-    // Required performance counter features not detected.
-    STEP_PERF_COUNTERS_UNAVAILABLE
+    // Spawning the initial tracee failed. An error message will be in
+    // failure_message.
+    STEP_SPAWN_FAILED
   };
   struct RecordResult {
     RecordStatus status;
     // When status == STEP_EXITED
-    int exit_code;
+    WaitStatus exit_status;
+    // When status == STEP_SPAWN_FAILED
+    std::string failure_message;
   };
   /**
    * Record some tracee execution.
@@ -66,11 +81,11 @@ public:
    */
   void terminate_recording();
 
-  virtual RecordSession* as_record() { return this; }
+  virtual RecordSession* as_record() override { return this; }
 
   TraceWriter& trace_writer() { return trace_out; }
 
-  virtual void on_destroy(Task* t);
+  virtual void on_destroy(Task* t) override;
 
   Scheduler& scheduler() { return scheduler_; }
 
@@ -83,55 +98,91 @@ public:
   struct StepState {
     // Continue with this continuation type.
     ContinueType continue_type;
-    // If continuing, inject this signal
-    int continue_sig;
-    StepState(ContinueType continue_type)
-        : continue_type(continue_type), continue_sig(0) {}
+    StepState(ContinueType continue_type) : continue_type(continue_type) {}
   };
 
   void set_enable_chaos(bool enable_chaos) {
+    scheduler().set_enable_chaos(enable_chaos);
     this->enable_chaos_ = enable_chaos;
   }
-  bool enable_chaos() { return enable_chaos_; }
+  bool enable_chaos() const { return enable_chaos_; }
+
+  void set_use_read_cloning(bool enable) { use_read_cloning_ = enable; }
+  void set_use_file_cloning(bool enable) { use_file_cloning_ = enable; }
+  void set_syscall_buffer_size(size_t size) { syscall_buffer_size_ = size; }
+
+  void set_wait_for_all(bool wait_for_all) {
+    this->wait_for_all_ = wait_for_all;
+  }
+
+  virtual Task* new_task(pid_t tid, pid_t rec_tid, uint32_t serial,
+                         SupportedArch a) override;
+
+  RecordTask* find_task(pid_t rec_tid) const;
+  RecordTask* find_task(const TaskUid& tuid) const;
+
+  /**
+   * This gets called when we detect that a task has been revived from the
+   * dead with a PTRACE_EVENT_EXEC. See ptrace man page under "execve(2) under
+   * ptrace" for the horrid details.
+   *
+   * The task in the task-group that triggered the successful execve has changed
+   * its tid to |rec_tid|. We mirror that, and emit TraceTaskEvents to make it
+   * look like a new task was spawned and the old task exited.
+   */
+  RecordTask* revive_task_for_exec(pid_t rec_tid);
 
 private:
-  RecordSession(const std::vector<std::string>& argv,
-                const std::vector<std::string>& envp, const std::string& cwd,
-                SyscallBuffering syscallbuf, BindCPU bind_cpu, Chaos chaos);
+  RecordSession(const std::string& exe_path,
+                const std::vector<std::string>& argv,
+                const std::vector<std::string>& envp,
+                SyscallBuffering syscallbuf, int bind_cpu);
 
-  virtual void on_create(Task* t);
+  virtual void on_create(Task* t) override;
 
-  void check_perf_counters_working(Task* t, RecordResult* step_result);
-  bool handle_ptrace_event(Task* t, StepState* step_state);
-  bool handle_signal_event(Task* t, StepState* step_state);
-  void runnable_state_changed(Task* t, RecordResult* step_result,
+  void handle_seccomp_traced_syscall(RecordTask* t,
+                                     RecordSession::StepState* step_state,
+                                     RecordResult* result,
+                                     bool* did_enter_syscall);
+  void process_syscall_entry(RecordTask* t, StepState* step_state,
+                             RecordResult* step_result);
+  void check_initial_task_syscalls(RecordTask* t, RecordResult* step_result);
+  bool handle_ptrace_event(RecordTask* t, StepState* step_state,
+                           RecordResult* result, bool* did_enter_syscall);
+  bool handle_signal_event(RecordTask* t, StepState* step_state);
+  void runnable_state_changed(RecordTask* t, StepState* step_state,
+                              RecordResult* step_result,
                               bool can_consume_wait_status);
-  void signal_state_changed(Task* t, StepState* step_state);
-  void syscall_state_changed(Task* t, StepState* step_state);
-  void desched_state_changed(Task* t);
-  bool prepare_to_inject_signal(Task* t, StepState* step_state);
-  void task_continue(Task* t, const StepState& step_state);
+  void signal_state_changed(RecordTask* t, StepState* step_state);
+  void syscall_state_changed(RecordTask* t, StepState* step_state);
+  void desched_state_changed(RecordTask* t);
+  bool prepare_to_inject_signal(RecordTask* t, StepState* step_state);
+  void task_continue(const StepState& step_state);
+  bool can_end();
 
   TraceWriter trace_out;
   Scheduler scheduler_;
-  Task* last_recorded_task;
   TaskGroup::shr_ptr initial_task_group;
   SeccompFilterRewriter seccomp_filter_rewriter_;
 
   int ignore_sig;
+  int continue_through_sig;
   Switchable last_task_switchable;
+  size_t syscall_buffer_size_;
   bool use_syscall_buffer_;
 
-  /* True when it's safe to deliver signals, namely, when the initial
-   * tracee has exec()'d the tracee image.  Before then, the address
-   * space layout will not be the same during replay as recording, so
-   * replay won't be able to find the right execution point to deliver
-   * the signal. */
-  bool can_deliver_signals;
+  bool use_file_cloning_;
+  bool use_read_cloning_;
   /**
    * When true, try to increase the probability of finding bugs.
    */
   bool enable_chaos_;
+  /**
+   * When true, wait for all tracees to exit before finishing recording.
+   */
+  bool wait_for_all_;
 };
+
+} // namespace rr
 
 #endif // RR_RECORD_SESSION_H_

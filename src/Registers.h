@@ -14,10 +14,12 @@
 #include "GdbRegister.h"
 #include "kernel_abi.h"
 #include "kernel_supplement.h"
-#include "remote_ptr.h"
 #include "remote_code_ptr.h"
+#include "remote_ptr.h"
 
-class Task;
+namespace rr {
+
+class ReplayTask;
 
 enum MismatchBehavior {
   EXPECT_MISMATCHES = 0,
@@ -71,7 +73,7 @@ public:
    * rr build is 32-bit, or when the Registers' arch is completely different
    * to the rr build (e.g. ARM vs x86).
    */
-  void set_from_ptrace(const struct user_regs_struct& ptrace_regs);
+  void set_from_ptrace(const struct ::user_regs_struct& ptrace_regs);
   /**
    * Get a user_regs_struct from these Registers. If the tracee architecture
    * is not rr's native architecture, then it must be a 32-bit tracee with a
@@ -81,7 +83,7 @@ public:
    * rr build is 32-bit, or when the Registers' arch is completely different
    * to the rr build (e.g. ARM vs x86).
    */
-  struct user_regs_struct get_ptrace() const;
+  struct ::user_regs_struct get_ptrace() const;
   /**
    * Get a user_regs_struct for a particular Arch from these Registers.
    * It's invalid to call this when 'arch' is 64-bit and the
@@ -89,6 +91,14 @@ public:
    * to the rr build (e.g. ARM vs x86).
    */
   std::vector<uint8_t> get_ptrace_for_arch(SupportedArch arch) const;
+  /**
+   * Copy an arch-specific user_regs_struct into these Registers.
+   * It's invalid to call this when 'arch' is 64-bit and the
+   * rr build is 32-bit, or when the Registers' arch is completely different
+   * to the rr build (e.g. ARM vs x86).
+   */
+  void set_from_ptrace_for_arch(SupportedArch arch, const void* data,
+                                size_t size);
 
 #define RR_GET_REG(x86case, x64case)                                           \
   (arch() == x86 ? (uint32_t)u.x86regs.x86case                                 \
@@ -137,24 +147,12 @@ public:
   /**
    * Returns true if syscall_result() indicates failure.
    */
-  bool syscall_failed() const {
-    auto result = syscall_result_signed();
-    return -ERANGE <= result && result < 0;
-  }
+  bool syscall_failed() const;
+
   /**
    * Returns true if syscall_result() indicates a syscall restart.
    */
-  bool syscall_may_restart() const {
-    switch (-syscall_result_signed()) {
-      case ERESTART_RESTARTBLOCK:
-      case ERESTARTNOINTR:
-      case ERESTARTNOHAND:
-      case ERESTARTSYS:
-        return true;
-      default:
-        return false;
-    }
-  }
+  bool syscall_may_restart() const;
 
   /**
    * This pseudo-register holds the system-call number when we get ptrace
@@ -235,12 +233,12 @@ public:
    * Set the register containing syscall argument |Index| to
    * |value|.
    */
-  template <int Index, typename T> void set_arg(T value) {
-    set_arg(Index, uintptr_t(value));
-  }
-
+  template <int Index> void set_arg(std::nullptr_t) { set_arg(Index, 0); }
   template <int Index, typename T> void set_arg(remote_ptr<T> value) {
     set_arg(Index, value.as_int());
+  }
+  template <int Index, typename T> void set_arg(T value) {
+    set_arg(Index, uintptr_t(value));
   }
 
   void set_arg(int index, uintptr_t value) {
@@ -272,10 +270,21 @@ public:
     RR_SET_REG(edx, rdx, value >> 32);
   }
 
-  uintptr_t r11() const {
+  void set_r8(uintptr_t value) {
     assert(arch() == x86_64);
-    return u.x64regs.r11;
+    u.x64regs.r8 = value;
   }
+
+  void set_r9(uintptr_t value) {
+    assert(arch() == x86_64);
+    u.x64regs.r9 = value;
+  }
+
+  void set_r10(uintptr_t value) {
+    assert(arch() == x86_64);
+    u.x64regs.r10 = value;
+  }
+
   void set_r11(uintptr_t value) {
     assert(arch() == x86_64);
     u.x64regs.r11 = value;
@@ -298,11 +307,30 @@ public:
   void clear_singlestep_flag() { set_flags(flags() & ~X86_TF_FLAG); }
   bool df_flag() const { return flags() & X86_DF_FLAG; }
 
+  uintptr_t fs_base() const {
+    assert(arch() == x86_64);
+    return u.x64regs.fs_base;
+  }
+  uintptr_t gs_base() const {
+    assert(arch() == x86_64);
+    return u.x64regs.gs_base;
+  }
+
+  void set_fs_base(uintptr_t fs_base) {
+    assert(arch() == x86_64);
+    u.x64regs.fs_base = fs_base;
+  }
+  void set_gs_base(uintptr_t gs_base) {
+    assert(arch() == x86_64);
+    u.x64regs.gs_base = gs_base;
+  }
+
+  uint32_t cs() const { return RR_GET_REG(xcs, cs); }
+
   // End of X86-specific stuff
 
   void print_register_file(FILE* f) const;
   void print_register_file_compact(FILE* f) const;
-  void print_register_file_for_trace(FILE* f) const;
   void print_register_file_for_trace_raw(FILE* f) const;
 
   /**
@@ -313,7 +341,7 @@ public:
    * match.  Passing BAIL_ON_MISMATCH will additionally abort on
    * mismatch.
    */
-  static bool compare_register_files(Task* t, const char* name1,
+  static bool compare_register_files(ReplayTask* t, const char* name1,
                                      const Registers& reg1, const char* name2,
                                      const Registers& reg2,
                                      MismatchBehavior mismatch_behavior);
@@ -322,11 +350,6 @@ public:
     return compare_register_files(nullptr, nullptr, *this, nullptr, other,
                                   EXPECT_MISMATCHES);
   }
-
-  /**
-   * Return the total number of registers for this target.
-   */
-  size_t total_registers() const;
 
   // TODO: refactor me to use the GdbRegisterValue helper from
   // GdbConnection.h.
@@ -350,11 +373,17 @@ public:
                                       bool* defined) const;
 
   /**
-   * Update the registe named |reg_name| to |value| with
+   * Update the register named |reg_name| to |value| with
    * |value_size| number of bytes.
    */
-  void write_register(GdbRegister reg_name, const uint8_t* value,
+  void write_register(GdbRegister reg_name, const void* value,
                       size_t value_size);
+
+  /**
+   * Update the register at user offset |offset| to |value|, taking the low
+   * bytes if necessary.
+   */
+  void write_register_by_user_offset(uintptr_t offset, uintptr_t value);
 
 private:
   template <typename Arch>
@@ -392,18 +421,36 @@ private:
                                            bool* defined) const;
 
   template <typename Arch>
-  void write_register_arch(GdbRegister regno, const uint8_t* value,
+  void write_register_arch(GdbRegister regno, const void* value,
                            size_t value_size);
+
+  template <typename Arch>
+  void write_register_by_user_offset_arch(uintptr_t offset, uintptr_t value);
 
   template <typename Arch> size_t total_registers_arch() const;
 
-  union AllRegisters {
+  SupportedArch arch_;
+  union {
     rr::X86Arch::user_regs_struct x86regs;
     rr::X64Arch::user_regs_struct x64regs;
   } u;
-  SupportedArch arch_;
 };
 
+template <typename ret, typename callback>
+ret with_converted_registers(const Registers& regs, SupportedArch arch,
+                             callback f) {
+  if (regs.arch() != arch) {
+    // If this is a cross architecture syscall, first convert the registers.
+    Registers converted_regs(arch);
+    std::vector<uint8_t> data = regs.get_ptrace_for_arch(arch);
+    converted_regs.set_from_ptrace_for_arch(arch, data.data(), data.size());
+    return f(converted_regs);
+  }
+  return f(regs);
+}
+
 std::ostream& operator<<(std::ostream& stream, const Registers& r);
+
+} // namespace rr
 
 #endif /* RR_REGISTERS_H_ */

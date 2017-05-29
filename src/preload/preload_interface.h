@@ -3,13 +3,56 @@
 #ifndef RR_PRELOAD_INTERFACE_H_
 #define RR_PRELOAD_INTERFACE_H_
 
-#include <signal.h>
-#include <stdint.h>
+#ifdef RR_IMPLEMENT_PRELOAD
+/* Avoid using <string.h> library functions */
+static inline int streq(const char* s1, const char* s2) {
+  while (1) {
+    if (*s1 != *s2) {
+      return 0;
+    }
+    if (!*s1) {
+      return 1;
+    }
+    ++s1;
+    ++s2;
+  }
+  return 1;
+}
+static inline size_t rrstrlen(const char* s) {
+  size_t ret = 0;
+  while (*s) {
+    ++s;
+    ++ret;
+  }
+  return ret;
+}
+#else
 #include <string.h>
-
-#ifndef RR_IMPLEMENT_PRELOAD
+static inline int streq(const char* s1, const char* s2) {
+  return !strcmp(s1, s2);
+}
+static inline size_t rrstrlen(const char* s) { return strlen(s); }
 #include "../remote_ptr.h"
 #endif
+
+#include <signal.h>
+#include <stdint.h>
+#include <sys/types.h>
+#include <sys/user.h>
+
+static inline int strprefix(const char* s1, const char* s2) {
+  while (1) {
+    if (!*s1) {
+      return 1;
+    }
+    if (*s1 != *s2) {
+      return 0;
+    }
+    ++s1;
+    ++s2;
+  }
+  return 1;
+}
 
 /* This header file is included by preload.c and various rr .cc files. It
  * defines the interface between the preload library and rr. preload.c
@@ -32,9 +75,6 @@
  * so we can't use it. */
 #define SYSCALLBUF_DESCHED_SIGNAL SIGPWR
 
-/* This size counts the header along with record data. */
-#define SYSCALLBUF_BUFFER_SIZE (1 << 20)
-
 /* Set this env var to enable syscall buffering. */
 #define SYSCALLBUF_ENABLED_ENV_VAR "_RR_USE_SYSCALLBUF"
 
@@ -43,25 +83,29 @@
  * to raise this value... */
 #define SYSCALLBUF_FDS_DISABLED_SIZE 1024
 
+#define MPROTECT_RECORD_COUNT 1000
+
+/* Must match generate_rr_page.py */
 #define RR_PAGE_ADDR 0x70000000
 #define RR_PAGE_SYSCALL_STUB_SIZE 3
 #define RR_PAGE_SYSCALL_INSTRUCTION_END 2
-#define RR_PAGE_IN_TRACED_SYSCALL_ADDR                                         \
-  (RR_PAGE_ADDR + RR_PAGE_SYSCALL_INSTRUCTION_END)
-#define RR_PAGE_IN_PRIVILEGED_TRACED_SYSCALL_ADDR                              \
-  (RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE + RR_PAGE_SYSCALL_INSTRUCTION_END)
-#define RR_PAGE_IN_UNTRACED_REPLAYED_SYSCALL_ADDR                              \
-  (RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE * 2 +                              \
-   RR_PAGE_SYSCALL_INSTRUCTION_END)
-#define RR_PAGE_IN_UNTRACED_SYSCALL_ADDR                                       \
-  (RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE * 3 +                              \
-   RR_PAGE_SYSCALL_INSTRUCTION_END)
-#define RR_PAGE_IN_PRIVILEGED_UNTRACED_SYSCALL_ADDR                            \
-  (RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE * 4 +                              \
-   RR_PAGE_SYSCALL_INSTRUCTION_END)
-#define RR_PAGE_FF_BYTES                                                       \
-  (RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE * 5 +                              \
-   RR_PAGE_SYSCALL_INSTRUCTION_END)
+#define RR_PAGE_SYSCALL_ADDR(index)                                            \
+  ((void*)(RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE * (index)))
+#define RR_PAGE_SYSCALL_TRACED RR_PAGE_SYSCALL_ADDR(0)
+#define RR_PAGE_SYSCALL_PRIVILEGED_TRACED RR_PAGE_SYSCALL_ADDR(1)
+#define RR_PAGE_SYSCALL_UNTRACED RR_PAGE_SYSCALL_ADDR(2)
+#define RR_PAGE_SYSCALL_UNTRACED_REPLAY_ONLY RR_PAGE_SYSCALL_ADDR(3)
+#define RR_PAGE_SYSCALL_UNTRACED_RECORDING_ONLY RR_PAGE_SYSCALL_ADDR(4)
+#define RR_PAGE_SYSCALL_PRIVILEGED_UNTRACED RR_PAGE_SYSCALL_ADDR(5)
+#define RR_PAGE_SYSCALL_PRIVILEGED_UNTRACED_REPLAY_ONLY RR_PAGE_SYSCALL_ADDR(6)
+#define RR_PAGE_SYSCALL_PRIVILEGED_UNTRACED_RECORDING_ONLY                     \
+  RR_PAGE_SYSCALL_ADDR(7)
+#define RR_PAGE_FF_BYTES (RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE * 8)
+
+/* PRELOAD_THREAD_LOCALS_ADDR should not change.
+ * Tools depend on this address. */
+#define PRELOAD_THREAD_LOCALS_ADDR (RR_PAGE_ADDR + PAGE_SIZE)
+#define PRELOAD_THREAD_LOCALS_SIZE 88
 
 /* "Magic" (rr-implemented) syscalls that we use to initialize the
  * syscallbuf.
@@ -88,16 +132,37 @@
  * 8/16(sp) is stored in original_syscallno.
  */
 #define SYS_rrcall_notify_syscall_hook_exit 444
+/**
+ * When the preload library detects that control data has been received in a
+ * syscallbuf'ed recvmsg, it calls this syscall with a pointer to the
+ * 'struct msg' returned.
+ */
+#define SYS_rrcall_notify_control_msg 445
+/**
+ * When rr replay has restored the auxv vectors for a new process (completing
+ * emulation of exec), it calls this syscall. It takes one parameter, the tid
+ * of the task that it has restored auxv vectors for.
+ */
+#define SYS_rrcall_reload_auxv 446
+/**
+ * When rr replay has flushed a syscallbuf 'mprotect' record, notify any outer
+ * rr of that flush. The first parameter is the tid of the task, the second
+ * parameter is the address, the third parameter is the length, and the
+ * fourth parameter is the prot.
+ */
+#define SYS_rrcall_mprotect_record 447
 
 /* Define macros that let us compile a struct definition either "natively"
  * (when included by preload.c) or as a template over Arch for use by rr.
  */
 #ifdef RR_IMPLEMENT_PRELOAD
 #define TEMPLATE_ARCH
-#define PTR(T) T *
+#define PTR(T) T*
+#define VOLATILE volatile
 #else
 #define TEMPLATE_ARCH template <typename Arch>
 #define PTR(T) typename Arch::template ptr<T>
+#define VOLATILE
 #endif
 
 /**
@@ -112,9 +177,138 @@
  * syscall and a hook function to patch with.
  */
 struct syscall_patch_hook {
+  uint8_t is_multi_instruction;
   uint8_t next_instruction_length;
   uint8_t next_instruction_bytes[6];
   uint64_t hook_address;
+};
+
+/**
+ * We buffer mprotect syscalls. Their effects need to be noted so we can
+ * update AddressSpace's cache of memory layout, which stores prot bits. So,
+ * the preload code builds a list of mprotect_records corresponding to the
+ * mprotect syscalls that have been buffered. This list is read by rr whenever
+ * we flush the syscallbuf, and its effects performed. The actual mprotect
+ * syscalls are performed during recording and replay.
+ *
+ * We simplify things by making this arch-independent.
+ */
+struct mprotect_record {
+  uint64_t start;
+  uint64_t size;
+  int32_t prot;
+  int32_t padding;
+};
+
+/**
+ * Must be arch-independent.
+ * Variables used to communicate between preload and rr.
+ * We package these up into a single struct to simplify the preload/rr
+ * interface.
+ */
+struct preload_globals {
+  /* 0 during recording, 1 during replay. Set by rr.
+   * This MUST NOT be used in conditional branches. It should only be used
+   * as the condition for conditional moves so that control flow during replay
+   * does not diverge from control flow during recording.
+   * We also have to be careful that values different between record and replay
+   * don't accidentally leak into other memory locations or registers.
+   * USE WITH CAUTION.
+   */
+  unsigned char in_replay;
+  /* 0 during recording and replay, 1 during diversion. Set by rr.
+   */
+  unsigned char in_diversion;
+  /* Number of cores to pretend we have. 0 means 1. rr sets this when
+   * the preload library is initialized. */
+  int pretend_num_cores;
+  /**
+   * Set by rr.
+   * If syscallbuf_fds_disabled[fd] is nonzero, then operations on that fd
+   * must be performed through traced syscalls, not the syscallbuf.
+   * The rr supervisor modifies this array directly to dynamically turn
+   * syscallbuf on and off for particular fds. fds outside the array range must
+   * never use the syscallbuf.
+   */
+  VOLATILE char syscallbuf_fds_disabled[SYSCALLBUF_FDS_DISABLED_SIZE];
+  /* mprotect records. Set by preload. */
+  struct mprotect_record mprotect_records[MPROTECT_RECORD_COUNT];
+};
+
+/**
+ * Can be architecture dependent. The rr process does not manipulate
+ * these except to save and restore the values on task switches so that
+ * the values are always effectively local to the current task. rr also
+ * sets the |syscallbuf_stub_alt_stack| field.
+ * We use this instead of regular libc TLS because sometimes buggy application
+ * code breaks libc TLS for some tasks. With this approach we can be sure
+ * thread-locals are usable for any task in any state.
+ */
+TEMPLATE_ARCH
+struct preload_thread_locals {
+  /* The offsets of these fields are hardcoded in syscall_hook.S and
+   * assembly_templates.py. Try to avoid changing them! */
+  /* Pointer to alt-stack used by syscallbuf stubs (allocated at the end of
+   * the scratch buffer */
+  PTR(void) syscallbuf_stub_alt_stack;
+  /* Where syscall result will be (or during replay, has been) saved.
+   * The offset of this field MUST NOT CHANGE, it is part of the preload ABI
+   * tools can depend on. */
+  PTR(int64_t) pending_untraced_syscall_result;
+  /* scratch space used by stub code */
+  PTR(void) stub_scratch_1;
+  int alt_stack_nesting_level;
+
+  /* Nonzero when thread-local state like the syscallbuf has been
+   * initialized.  */
+  int thread_inited;
+  /* When buffering is enabled, points at the thread's mapped buffer
+   * segment.  At the start of the segment is an object of type |struct
+   * syscallbuf_hdr|, so |buffer| is also a pointer to the buffer
+   * header. */
+  PTR(uint8_t) buffer;
+  size_t buffer_size;
+  /* This is used to support the buffering of "may-block" system calls.
+   * The problem that needs to be addressed can be introduced with a
+   * simple example; assume that we're buffering the "read" and "write"
+   * syscalls.
+   *
+   *  o (Tasks W and R set up a synchronous-IO pipe open between them; W
+   *    "owns" the write end of the pipe; R owns the read end; the pipe
+   *    buffer is full)
+   *  o Task W invokes the write syscall on the pipe
+   *  o Since write is a buffered syscall, the seccomp filter traps W
+   *    directly to the kernel; there's no trace event for W delivered
+   *    to rr.
+   *  o The pipe is full, so W is descheduled by the kernel because W
+   *    can't make progress.
+   *  o rr thinks W is still running and doesn't schedule R.
+   *
+   * At this point, progress in the recorded application can only be
+   * made by scheduling R, but no one tells rr to do that.  Oops!
+   *
+   * Thus enter the "desched counter".  It's a perf_event for the "sw t
+   * switches" event (which, more precisely, is "sw deschedule"; it
+   * counts schedule-out, not schedule-in).  We program the counter to
+   * deliver a signal to this task when there's new counter data
+   * available.  And we set up the "sample period", how many descheds
+   * are triggered before the signal is delivered, to be "1".  This
+   * means that when the counter is armed, the next desched (i.e., the
+   * next time the desched counter is bumped up) of this task will
+   * deliver the signal to it.  And signal delivery always generates a
+   * ptrace trap, so rr can deduce that this task was descheduled and
+   * schedule another.
+   *
+   * The description above is sort of an idealized view; there are
+   * numerous implementation details that are documented in
+   * handle_signal.c, where they're dealt with. */
+  int desched_counter_fd;
+  int cloned_file_data_fd;
+  off_t cloned_file_data_offset;
+  PTR(void) scratch_buf;
+  size_t scratch_size;
+
+  PTR(struct msghdr) notify_control_msg;
 };
 
 /**
@@ -123,20 +317,20 @@ struct syscall_patch_hook {
  */
 TEMPLATE_ARCH
 struct rrcall_init_preload_params {
-  /* "In" params. */
+  /* All "In" params. */
   /* The syscallbuf lib's idea of whether buffering is enabled.
    * We let the syscallbuf code decide in order to more simply
    * replay the same decision that was recorded. */
   int syscallbuf_enabled;
   int syscall_patch_hook_count;
   PTR(struct syscall_patch_hook) syscall_patch_hooks;
-  PTR(void) syscall_hook_trampoline;
-  PTR(void) syscall_hook_stub_buffer;
-  PTR(void) syscall_hook_stub_buffer_end;
-  /* Array of size SYSCALLBUF_FDS_DISABLED_SIZE */
-  PTR(volatile char) syscallbuf_fds_disabled;
-  /* Address of the flag which is 0 during recording and 1 during replay. */
-  PTR(unsigned char) in_replay_flag;
+  PTR(void) syscallhook_vsyscall_entry;
+  PTR(void) syscallbuf_code_start;
+  PTR(void) syscallbuf_code_end;
+  PTR(void) get_pc_thunks_start;
+  PTR(void) get_pc_thunks_end;
+  PTR(void) syscallbuf_final_exit_instruction;
+  PTR(struct preload_globals) globals;
   /* Address of the first entry of the breakpoint table.
    * After processing a sycallbuf record (and unlocking the syscallbuf),
    * we call a function in this table corresponding to the record processed.
@@ -155,15 +349,15 @@ TEMPLATE_ARCH
 struct rrcall_init_buffers_params {
   /* The fd we're using to track desched events. */
   int desched_counter_fd;
-  /* padding for 64-bit archs. Structs written to tracee memory must not have
-   * holes!
-   */
-  int padding;
-
   /* "Out" params. */
+  int cloned_file_data_fd;
   /* Returned pointer to and size of the shared syscallbuf
    * segment. */
   PTR(void) syscallbuf_ptr;
+  /* Returned pointer to rr's syscall scratch buffer */
+  PTR(void) scratch_buf;
+  uint32_t syscallbuf_size;
+  uint32_t scratch_size;
 };
 
 /**
@@ -211,28 +405,64 @@ struct syscallbuf_hdr {
    * Make this volatile so that memory writes aren't reordered around
    * updates to this field. */
   volatile uint32_t num_rec_bytes;
+  /* Number of mprotect calls since last syscallbuf flush. The last record in
+   * the list may not have been applied yet.
+   */
+  volatile uint32_t mprotect_record_count;
+  /* Number of records whose syscalls have definitely completed.
+   * May be one less than mprotect_record_count.
+   */
+  volatile uint32_t mprotect_record_count_completed;
   /* True if the current syscall should not be committed to the
    * buffer, for whatever reason; likely interrupted by
    * desched. Set by rr. */
-  uint8_t abort_commit;
+  volatile uint8_t abort_commit;
   /* True if, next time we exit the syscall buffer hook, libpreload should
    * execute SYS_rrcall_notify_syscall_hook_exit to give rr the opportunity to
    * deliver a signal and/or reset the syscallbuf. */
-  uint8_t notify_on_syscall_hook_exit;
+  volatile uint8_t notify_on_syscall_hook_exit;
   /* This tracks whether the buffer is currently in use for a
-   * system call. This is helpful when a signal handler runs
-   * during a wrapped system call; we don't want it to use the
-   * buffer for its system calls. */
-  uint8_t locked;
+   * system call or otherwise unavailable. This is helpful when
+   * a signal handler runs during a wrapped system call; we don't want
+   * it to use the buffer for its system calls. The different reasons why the
+   * buffer could be locked, use different bits of this field and the buffer
+   * may be used only if all are clear. See enum syscallbuf_locked_why for
+   * used bits.
+   */
+  volatile uint8_t locked;
   /* Nonzero when rr needs to worry about the desched signal.
    * When it's zero, the desched signal can safely be
    * discarded. */
-  uint8_t desched_signal_may_be_relevant;
+  volatile uint8_t desched_signal_may_be_relevant;
+  /* A copy of the tasks's signal mask. Updated by preload when a buffered
+   * rt_sigprocmask executes.
+   */
+  volatile uint64_t blocked_sigs;
+  /* Incremented by preload every time a buffered rt_sigprocmask executes.
+   * Cleared during syscallbuf reset.
+   */
+  volatile uint32_t blocked_sigs_generation;
+  /* Nonzero when preload is in the process of calling an untraced
+   * sigprocmask; the real sigprocmask may or may not match blocked_sigs.
+   */
+  volatile uint8_t in_sigprocmask_critical_section;
 
   struct syscallbuf_record recs[0];
 } __attribute__((__packed__));
 /* TODO: static_assert(sizeof(uint32_t) ==
  *                     sizeof(struct syscallbuf_hdr)) */
+
+/**
+ * Each bit of of syscallbuf_hdr->locked indicates a reason why the syscallbuf
+ * is locked. These are all the bits that are currently defined.
+ */
+enum syscallbuf_locked_why {
+  /* Used by the tracee, during interruptible syscalls to avoid recursion */
+  SYSCALLBUF_LOCKED_TRACEE = 0x1,
+  /* Used by the tracer to prevent syscall buffering when necessary to preserve
+     semantics (e.g. for ptracees whose syscalls are being observed) */
+  SYSCALLBUF_LOCKED_TRACER = 0x2
+};
 
 /**
  * Return a pointer to what may be the next syscall record.
@@ -266,9 +496,52 @@ inline static long stored_record_size(size_t length) {
  * too much by piling on.
  */
 inline static int is_blacklisted_filename(const char* filename) {
-  return !strncmp("/dev/dri/", filename, 9) ||
-         !strcmp("/dev/nvidiactl", filename) ||
-         !strcmp("/usr/share/alsa/alsa.conf", filename);
+  return strprefix("/dev/dri/", filename) ||
+         streq("/dev/nvidiactl", filename) ||
+         streq("/usr/share/alsa/alsa.conf", filename);
+}
+
+inline static int is_gcrypt_deny_file(const char* filename) {
+  return streq("/etc/gcrypt/hwf.deny", filename);
+}
+
+inline static int is_terminal(const char* filename) {
+  return strprefix("/dev/tty", filename) || strprefix("/dev/pts", filename);
+}
+
+inline static int is_proc_mem_file(const char* filename) {
+  if (!strprefix("/proc/", filename)) {
+    return 0;
+  }
+  return streq(filename + rrstrlen(filename) - 4, "/mem");
+}
+
+inline static int is_proc_fd_dir(const char* filename) {
+  if (!strprefix("/proc/", filename)) {
+    return 0;
+  }
+
+  int len = rrstrlen(filename);
+  const char* fd_bit = filename + len;
+  if (*fd_bit == '/') {
+    fd_bit--;
+  }
+
+  return strprefix("/fd", fd_bit - 3);
+}
+
+/**
+ * Returns nonzero if an attempted open() of |filename| can be syscall-buffered.
+ * When this returns zero, the open must be forwarded to the rr process.
+ * This is imperfect because it doesn't handle symbolic links, hard links,
+ * files accessed with non-absolute paths, /proc mounted in differnet places,
+ * etc etc etc. Handling those efficiently (no additional syscalls in
+ * common cases) is a problem. Maybe we could afford fstat after every open...
+ */
+inline static int allow_buffered_open(const char* filename) {
+  return !is_blacklisted_filename(filename) && !is_gcrypt_deny_file(filename) &&
+         !is_terminal(filename) && !is_proc_mem_file(filename) &&
+         !is_proc_fd_dir(filename);
 }
 
 #endif /* RR_PRELOAD_INTERFACE_H_ */

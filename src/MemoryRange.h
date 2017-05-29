@@ -3,7 +3,11 @@
 #ifndef RR_MEMORY_RANGE_H_
 #define RR_MEMORY_RANGE_H_
 
+#include <assert.h>
+
 #include "remote_ptr.h"
+
+namespace rr {
 
 /**
  * Range of memory addresses that can be used as a std::map key.
@@ -36,6 +40,7 @@ public:
   bool contains(const MemoryRange& o) const {
     return start_ <= o.start_ && o.end_ <= end_;
   }
+  bool contains(remote_ptr<void> p) const { return start_ <= p && p < end_; }
 
   bool intersects(const MemoryRange& other) const {
     remote_ptr<void> s = std::max(start_, other.start_);
@@ -67,5 +72,7 @@ inline std::ostream& operator<<(std::ostream& o, const MemoryRange& m) {
   o << m.start() << "-" << m.end();
   return o;
 }
+
+} // namespace rr
 
 #endif /* RR_MEMORY_RANGE_H_ */

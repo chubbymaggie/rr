@@ -5,6 +5,8 @@
 
 #include "FileMonitor.h"
 
+namespace rr {
+
 /**
  * A FileMonitor to track writes to RR_MAGIC_SAVE_DATA_FD.
  */
@@ -12,11 +14,12 @@ class MagicSaveDataMonitor : public FileMonitor {
 public:
   MagicSaveDataMonitor() {}
 
-  /**
-   * During recording, record the written data.
-   * During replay, check that the written data matches what was recorded.
-   */
-  virtual void did_write(Task* t, const std::vector<Range>& ranges);
+  virtual Type type() override { return MagicSaveData; }
+
+  virtual void did_write(Task* t, const std::vector<Range>& ranges,
+                         LazyOffset& offset) override;
 };
+
+} // namespace rr
 
 #endif /* RR_MAGIC_SAVE_DATA_MONITOR_H_ */

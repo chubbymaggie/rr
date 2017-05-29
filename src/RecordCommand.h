@@ -5,9 +5,11 @@
 
 #include "Command.h"
 
+namespace rr {
+
 class RecordCommand : public Command {
 public:
-  virtual int run(std::vector<std::string>& args);
+  virtual int run(std::vector<std::string>& args) override;
 
   static RecordCommand* get() { return &singleton; }
 
@@ -16,5 +18,7 @@ protected:
 
   static RecordCommand singleton;
 };
+
+} // namespace rr
 
 #endif // RR_RECORD_COMMAND_H_

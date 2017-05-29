@@ -7,25 +7,60 @@ static void breakpoint(void) {
   (void)break_here;
 }
 
-static const double st0 = 1;
-static const double st1 = 2;
-static const double st2 = 3;
-static const double st3 = 4;
-static const double st4 = 5;
-static const double st5 = 6;
-static const double st6 = 7;
-static const double st7 = 8;
+enum cpuid_requests {
+  CPUID_GETFEATURES = 0x01,
+};
 
-static const float xmm0 = 10;
-static const float xmm1 = 11;
-static const float xmm2 = 12;
-static const float xmm3 = 13;
-static const float xmm4 = 14;
-static const float xmm5 = 15;
-static const float xmm6 = 16;
-static const float xmm7 = 17;
+static void cpuid(int code, int subrequest, unsigned int* a, unsigned int* c,
+                  unsigned int* d) {
+  asm volatile("cpuid"
+               : "=a"(*a), "=c"(*c), "=d"(*d)
+               : "a"(code), "c"(subrequest)
+               : "ebx");
+}
+
+static __attribute__((used)) const double st0 = 1;
+static __attribute__((used)) const double st1 = 2;
+static __attribute__((used)) const double st2 = 3;
+static __attribute__((used)) const double st3 = 4;
+static __attribute__((used)) const double st4 = 5;
+static __attribute__((used)) const double st5 = 6;
+static __attribute__((used)) const double st6 = 7;
+static __attribute__((used)) const double st7 = 8;
+
+static __attribute__((used)) const float xmm0 = 10;
+static __attribute__((used)) const float xmm1 = 11;
+static __attribute__((used)) const float xmm2 = 12;
+static __attribute__((used)) const float xmm3 = 13;
+static __attribute__((used)) const float xmm4 = 14;
+static __attribute__((used)) const float xmm5 = 15;
+static __attribute__((used)) const float xmm6 = 16;
+static __attribute__((used)) const float xmm7 = 17;
+static __attribute__((used)) const float xmm8 = 18;
+static __attribute__((used)) const float xmm9 = 19;
+static __attribute__((used)) const float xmm10 = 20;
+static __attribute__((used)) const float xmm11 = 21;
+static __attribute__((used)) const float xmm12 = 22;
+static __attribute__((used)) const float xmm13 = 23;
+static __attribute__((used)) const float xmm14 = 24;
+static __attribute__((used)) const float xmm15 = 25;
+
+#define AVX_FEATURE_FLAG (1 << 28)
+#define OSXSAVE_FEATURE_FLAG (1 << 27)
+
+static int AVX_enabled;
 
 int main(void) {
+  unsigned int eax, ecx, edx;
+  unsigned int required_cpuid_flags = AVX_FEATURE_FLAG | OSXSAVE_FEATURE_FLAG;
+
+  cpuid(CPUID_GETFEATURES, 0, &eax, &ecx, &edx);
+  AVX_enabled = (ecx & required_cpuid_flags) == required_cpuid_flags;
+
+  if (!AVX_enabled) {
+    atomic_puts("AVX YMM registers disabled, not tested");
+  }
+
   __asm__ __volatile__(
 /* Push the constants in stack order so they look as
  * we expect in gdb. */
@@ -63,10 +98,43 @@ int main(void) {
       "movss xmm5(%rip), %xmm5\n\t"
       "movss xmm6(%rip), %xmm6\n\t"
       "movss xmm7(%rip), %xmm7\n\t"
+      "movss xmm8(%rip), %xmm8\n\t"
+      "movss xmm9(%rip), %xmm9\n\t"
+      "movss xmm10(%rip), %xmm10\n\t"
+      "movss xmm11(%rip), %xmm11\n\t"
+      "movss xmm12(%rip), %xmm12\n\t"
+      "movss xmm13(%rip), %xmm13\n\t"
+      "movss xmm14(%rip), %xmm14\n\t"
+      "movss xmm15(%rip), %xmm15\n\t"
 #else
 #error unexpected architecture
 #endif
       );
+
+  if (AVX_enabled) {
+    __asm__ __volatile__(
+#if defined(__i386__) || defined(__x86_64__)
+        "vinsertf128 $1,%xmm1,%ymm0,%ymm0\n\t"
+        "vinsertf128 $1,%xmm2,%ymm1,%ymm1\n\t"
+        "vinsertf128 $1,%xmm3,%ymm2,%ymm2\n\t"
+        "vinsertf128 $1,%xmm4,%ymm3,%ymm3\n\t"
+        "vinsertf128 $1,%xmm5,%ymm4,%ymm4\n\t"
+        "vinsertf128 $1,%xmm6,%ymm5,%ymm5\n\t"
+        "vinsertf128 $1,%xmm7,%ymm6,%ymm6\n\t"
+        "vinsertf128 $1,%xmm0,%ymm7,%ymm7\n\t"
+#endif
+#ifdef __x86_64__
+        "vinsertf128 $1,%xmm9,%ymm8,%ymm8\n\t"
+        "vinsertf128 $1,%xmm10,%ymm9,%ymm9\n\t"
+        "vinsertf128 $1,%xmm11,%ymm10,%ymm10\n\t"
+        "vinsertf128 $1,%xmm12,%ymm11,%ymm11\n\t"
+        "vinsertf128 $1,%xmm13,%ymm12,%ymm12\n\t"
+        "vinsertf128 $1,%xmm14,%ymm13,%ymm13\n\t"
+        "vinsertf128 $1,%xmm15,%ymm14,%ymm14\n\t"
+        "vinsertf128 $1,%xmm8,%ymm15,%ymm15\n\t"
+#endif
+        );
+  }
 
   breakpoint();
 

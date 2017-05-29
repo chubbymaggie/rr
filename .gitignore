@@ -15,8 +15,12 @@ Profile
 obj/
 .project
 *.log
+*.orig
+*.rej
 *.pyc
 *.record
 *.replay
 .settings/
 Testing/
+.idea/
+.*.swp

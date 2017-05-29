@@ -4,13 +4,20 @@
 #define RR_REPLAY_SESSION_H_
 
 #include <memory>
+#include <set>
 
+#include "AddressSpace.h"
 #include "CPUIDBugDetector.h"
 #include "DiversionSession.h"
 #include "EmuFs.h"
 #include "Session.h"
+#include "Task.h"
 
 struct syscallbuf_hdr;
+
+namespace rr {
+
+class ReplayTask;
 
 /**
  * ReplayFlushBufferedSyscallState is saved in Session and cloned with its
@@ -67,6 +74,8 @@ struct ReplayTraceStep {
 
   union {
     struct {
+      /* The architecture of the syscall */
+      SupportedArch arch;
       /* The syscall number we expect to
        * enter/exit. */
       int number;
@@ -135,6 +144,10 @@ public:
 
   ~ReplaySession();
 
+  virtual Task* new_task(pid_t tid, pid_t rec_tid, uint32_t serial,
+                         SupportedArch a) override;
+
+  using Session::clone;
   /**
    * Return a semantic copy of all the state managed by this,
    * that is the entire tracee tree and the state it depends on.
@@ -166,12 +179,6 @@ public:
 
   EmuFs& emufs() const { return *emu_fs; }
 
-  /** Collect garbage files from this session's emufs. */
-  void gc_emufs();
-
-  /** Run emufs gc if this syscall may release a file */
-  void maybe_gc_emufs(SupportedArch arch, int syscallno);
-
   TraceReader& trace_reader() { return trace_in; }
   const TraceReader& trace_reader() const { return trace_in; }
 
@@ -184,10 +191,13 @@ public:
   /**
    * The Task for the current trace record.
    */
-  Task* current_task() {
+  ReplayTask* current_task() {
     finish_initializing();
     return find_task(trace_frame.tid());
   }
+
+  ReplayTask* find_task(pid_t rec_tid) const;
+  ReplayTask* find_task(const TaskUid& tuid) const;
 
   /**
    * Returns true if the next step for this session is to exit a syscall with
@@ -248,7 +258,7 @@ public:
     return replay_step(StepConstraints(command));
   }
 
-  virtual ReplaySession* as_replay() { return this; }
+  virtual ReplaySession* as_replay() override { return this; }
 
   /**
    * Return true if |sig| is a signal that may be generated during
@@ -262,81 +272,75 @@ public:
   static bool is_ignored_signal(int sig);
 
   struct Flags {
-    Flags() : redirect_stdio(false) {}
+    Flags() : redirect_stdio(false), share_private_mappings(false) {}
     Flags(const Flags& other) = default;
     bool redirect_stdio;
+    bool share_private_mappings;
   };
   bool redirect_stdio() { return flags.redirect_stdio; }
+  bool share_private_mappings() { return flags.share_private_mappings; }
 
   void set_flags(const Flags& flags) { this->flags = flags; }
 
+  typedef std::set<MemoryRange, MappingComparator> MemoryRanges;
+  /**
+   * Returns an ordered set of MemoryRanges representing the address space
+   * that is never allocated by any process in the whole lifetime of the trace.
+   */
+  static MemoryRanges always_free_address_space(const TraceReader& reader);
+
 private:
-  ReplaySession(const std::string& dir)
-      : emu_fs(EmuFs::create()),
-        trace_in(dir),
-        trace_frame(),
-        current_step(),
-        ticks_at_start_of_event(0) {
-    advance_to_next_trace_frame();
-  }
+  ReplaySession(const std::string& dir);
+  ReplaySession(const ReplaySession& other);
 
-  ReplaySession(const ReplaySession& other)
-      : Session(other),
-        emu_fs(other.emu_fs->clone()),
-        trace_in(other.trace_in),
-        trace_frame(other.trace_frame),
-        current_step(other.current_step),
-        ticks_at_start_of_event(other.ticks_at_start_of_event),
-        cpuid_bug_detector(other.cpuid_bug_detector),
-        flags(other.flags) {}
-
-  void setup_replay_one_trace_frame(Task* t);
+  ReplayTask* revive_task_for_exec();
+  ReplayTask* setup_replay_one_trace_frame(ReplayTask* t);
   void advance_to_next_trace_frame();
-  Completion emulate_signal_delivery(Task* oldtask, int sig);
-  Completion try_one_trace_step(Task* t,
+  Completion emulate_signal_delivery(ReplayTask* oldtask, int sig);
+  Completion try_one_trace_step(ReplayTask* t,
                                 const StepConstraints& step_constraints);
-  Completion cont_syscall_boundary(Task* t, const StepConstraints& constraints);
-  Completion enter_syscall(Task* t, const StepConstraints& constraints);
-  Completion exit_syscall(Task* t);
-  Completion exit_task(Task* t);
-  void check_ticks_consistency(Task* t, const Event& ev);
-  void check_pending_sig(Task* t);
-  void continue_or_step(Task* t, const StepConstraints& constraints,
+  Completion cont_syscall_boundary(ReplayTask* t,
+                                   const StepConstraints& constraints);
+  Completion enter_syscall(ReplayTask* t, const StepConstraints& constraints);
+  Completion exit_syscall(ReplayTask* t);
+  Completion exit_task(ReplayTask* t);
+  void check_ticks_consistency(ReplayTask* t, const Event& ev);
+  void check_pending_sig(ReplayTask* t);
+  void continue_or_step(ReplayTask* t, const StepConstraints& constraints,
                         TicksRequest tick_request,
-                        ResumeRequest resume_how = RESUME_SYSCALL);
-  enum ExecStateType { UNKNOWN, NOT_AT_TARGET, AT_TARGET };
-  TrapType compute_trap_type(Task* t, int target_sig,
-                             SignalDeterministic deterministic,
-                             ExecStateType exec_state,
-                             const StepConstraints& constraints);
-  bool is_debugger_trap(Task* t, int target_sig,
-                        SignalDeterministic deterministic,
-                        ExecStateType exec_state,
-                        const StepConstraints& constraints);
-  Completion advance_to(Task* t, const Registers& regs, int sig,
-                        const StepConstraints& constraints, Ticks ticks);
-  Completion advance_to_ticks_target(Task* t,
+                        ResumeRequest resume_how = RESUME_SYSEMU);
+  Completion advance_to_ticks_target(ReplayTask* t,
                                      const StepConstraints& constraints);
-  Completion emulate_deterministic_signal(Task* t, int sig,
+  Completion emulate_deterministic_signal(ReplayTask* t, int sig,
                                           const StepConstraints& constraints);
-  Completion emulate_async_signal(Task* t, const StepConstraints& constraints,
+  Completion emulate_async_signal(ReplayTask* t,
+                                  const StepConstraints& constraints,
                                   Ticks ticks);
-  void prepare_syscallbuf_records(Task* t);
-  Completion flush_syscallbuf(Task* t, const StepConstraints& constraints);
-  Completion patch_next_syscall(Task* t, const StepConstraints& constraints);
-  void check_approaching_ticks_target(Task* t,
+  void prepare_syscallbuf_records(ReplayTask* t);
+  Completion flush_syscallbuf(ReplayTask* t,
+                              const StepConstraints& constraints);
+  Completion patch_next_syscall(ReplayTask* t,
+                                const StepConstraints& constraints);
+  void check_approaching_ticks_target(ReplayTask* t,
                                       const StepConstraints& constraints,
                                       BreakStatus& break_status);
 
+  void clear_syscall_bp();
+
   std::shared_ptr<EmuFs> emu_fs;
-  Task* last_debugged_task;
   TraceReader trace_in;
   TraceFrame trace_frame;
   ReplayTraceStep current_step;
   Ticks ticks_at_start_of_event;
   CPUIDBugDetector cpuid_bug_detector;
+  siginfo_t last_siginfo_;
   Flags flags;
   bool did_fast_forward;
+
+  std::shared_ptr<AddressSpace> syscall_bp_vm;
+  remote_code_ptr syscall_bp_addr;
 };
+
+} // namespace rr
 
 #endif // RR_REPLAY_SESSION_H_

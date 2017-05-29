@@ -6,10 +6,13 @@
 
 #include <rr/rr.h>
 
-#include "log.h"
+#include "RecordTask.h"
+#include "ReplayTask.h"
 #include "Session.h"
-#include "task.h"
+#include "log.h"
 #include "util.h"
+
+namespace rr {
 
 static void dump_path_data(Task* t, TraceFrame::Time global_time,
                            const char* tag, char* filename,
@@ -19,7 +22,7 @@ static void dump_path_data(Task* t, TraceFrame::Time global_time,
   dump_binary_data(filename, tag, (const uint32_t*)buf, buf_len / 4, addr);
 }
 
-static void notify_save_data_error(Task* t, remote_ptr<void> addr,
+static void notify_save_data_error(ReplayTask* t, remote_ptr<void> addr,
                                    const void* rec_buf, size_t rec_buf_len,
                                    const void* rep_buf, size_t rep_buf_len) {
   char rec_dump[PATH_MAX];
@@ -52,18 +55,22 @@ static void notify_save_data_error(Task* t, remote_ptr<void> addr,
       << rec_dump << " " << rep_dump << " >save-data-diverge.diff\n";
 }
 
-void MagicSaveDataMonitor::did_write(Task* t,
-                                     const std::vector<Range>& ranges) {
+void MagicSaveDataMonitor::did_write(Task* t, const std::vector<Range>& ranges,
+                                     LazyOffset&) {
   for (auto& r : ranges) {
     if (t->session().is_recording()) {
-      t->record_remote(r.data.cast<uint8_t>(), r.length);
+      static_cast<RecordTask*>(t)->record_remote(r.data.cast<uint8_t>(),
+                                                 r.length);
     } else if (t->session().is_replaying()) {
-      auto bytes = t->read_mem(r.data.cast<uint8_t>(), r.length);
-      auto rec = t->trace_reader().read_raw_data();
+      auto rt = static_cast<ReplayTask*>(t);
+      auto bytes = rt->read_mem(r.data.cast<uint8_t>(), r.length);
+      auto rec = rt->trace_reader().read_raw_data();
       if (rec.data != bytes) {
-        notify_save_data_error(t, rec.addr, rec.data.data(), rec.data.size(),
+        notify_save_data_error(rt, rec.addr, rec.data.data(), rec.data.size(),
                                bytes.data(), bytes.size());
       }
     }
   }
 }
+
+} // namespace rr

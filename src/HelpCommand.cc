@@ -5,9 +5,11 @@
 
 using namespace std;
 
+namespace rr {
+
 class HelpCommand : public Command {
 public:
-  virtual int run(std::vector<std::string>& args);
+  virtual int run(std::vector<std::string>& args) override;
 
 protected:
   HelpCommand(const char* name, const char* help) : Command(name, help) {}
@@ -35,3 +37,5 @@ int HelpCommand::run(std::vector<std::string>& args) {
   command->print_help(stdout);
   return 0;
 }
+
+} // namespace rr

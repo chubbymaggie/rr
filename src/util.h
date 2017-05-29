@@ -7,11 +7,18 @@
 #include <map>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "Event.h"
-#include "remote_ptr.h"
 #include "ScopedFd.h"
 #include "TraceFrame.h"
+#include "remote_ptr.h"
+
+#ifndef __has_attribute
+#define __has_attribute(x) 0
+#endif
+
+namespace rr {
 
 /*
  * This file is a dumping ground for functionality that needs to be shared but
@@ -25,7 +32,7 @@ class KernelMapping;
 class Task;
 class TraceFrame;
 
-template <typename T, size_t N> constexpr size_t array_length(T(&)[N]) {
+template <typename T, size_t N> constexpr size_t array_length(T (&)[N]) {
   return N;
 }
 
@@ -56,34 +63,7 @@ template <typename T> bool type_has_no_holes() {
   return check;
 }
 
-#define SHMEM_FS "/dev/shm"
-
-/* The syscallbuf shared with tracees is created with this prefix
- * followed by the tracee tid, then immediately unlinked and shared
- * anonymously. */
-#define SYSCALLBUF_SHMEM_PATH_PREFIX "/tmp/rr-tracee-shmem-"
-
-#define PREFIX_FOR_EMPTY_MMAPED_REGIONS "/tmp/rr-emptyfile-"
-
 enum Completion { COMPLETE, INCOMPLETE };
-
-/**
- * During recording, sometimes we need to ensure that an iteration of
- * RecordSession::record_step schedules the same task as in the previous
- * iteration. The PREVENT_SWITCH value indicates that this is required.
- * For example, the futex operation FUTEX_WAKE_OP modifies userspace
- * memory; those changes are only recorded after the system call completes;
- * and they must be replayed before we allow a context switch to a woken-up
- * task (because the kernel guarantees those effects are seen by woken-up
- * tasks).
- * Entering a potentially blocking system call must use ALLOW_SWITCH, or
- * we risk deadlock. Most non-blocking system calls could use PREVENT_SWITCH
- * or ALLOW_SWITCH; for simplicity we use ALLOW_SWITCH to indicate a call could
- * block and PREVENT_SWITCH otherwise.
- * Note that even if a system call uses PREVENT_SWITCH, as soon as we've
- * recorded the completion of the system call, we can switch to another task.
- */
-enum Switchable { PREVENT_SWITCH, ALLOW_SWITCH };
 
 /**
  * Create a file named |filename| and dump |buf_len| words in |buf| to
@@ -171,7 +151,7 @@ size_t page_size();
 enum signal_action { DUMP_CORE, TERMINATE, CONTINUE, STOP, IGNORE };
 signal_action default_action(int sig);
 
-SignalDeterministic is_deterministic_signal(const siginfo_t& si);
+SignalDeterministic is_deterministic_signal(Task* t);
 
 /**
  * Return nonzero if a mapping of |filename| with metadata |stat|,
@@ -195,6 +175,7 @@ enum cpuid_requests {
   CPUID_GETFEATURES,
   CPUID_GETTLB,
   CPUID_GETSERIAL,
+  CPUID_GETEXTENDEDFEATURES = 0x07,
   CPUID_GETXSAVE = 0x0D,
   CPUID_INTELEXTENDED = 0x80000000,
   CPUID_INTELFEATURES,
@@ -203,22 +184,31 @@ enum cpuid_requests {
   CPUID_INTELBRANDSTRINGEND,
 };
 
+const int OSXSAVE_FEATURE_FLAG = 1 << 27;
+const int AVX_FEATURE_FLAG = 1 << 28;
+const int HLE_FEATURE_FLAG = 1 << 4;
+
 /** issue a single request to CPUID. Fits 'intel features', for instance
  *  note that even if only "eax" and "edx" are of interest, other registers
  *  will be modified by the operation, so we need to tell the compiler about it.
  *  'code' is placed in EAX. 'subrequest' is placed in ECX.
  *  *a, *c and *d receive EAX, ECX and EDX respectively.
  */
-void cpuid(int code, int subrequest, unsigned int* a, unsigned int* c,
-           unsigned int* d);
+struct CPUIDData {
+  unsigned int eax, ebx, ecx, edx;
+};
+CPUIDData cpuid(int code, int subrequest);
 
+struct CloneParameters {
+  remote_ptr<void> stack;
+  remote_ptr<int> ptid;
+  remote_ptr<void> tls;
+  remote_ptr<int> ctid;
+};
 /**
  * Extract various clone(2) parameters out of the given Task's registers.
- * Each remote_ptr parameter may be nullptr.
  */
-void extract_clone_parameters(Task* t, remote_ptr<void>* stack,
-                              remote_ptr<int>* ptid, remote_ptr<void>* tls,
-                              remote_ptr<int>* ctid);
+CloneParameters extract_clone_parameters(Task* t);
 
 /**
  * Read the ELF CLASS from the given filename. If it's unable to be read,
@@ -243,6 +233,96 @@ std::string exe_directory();
  * Get the current time from the preferred monotonic clock in units of
  * seconds, relative to an unspecific point in the past.
  */
-double monotonic_now_sec(void);
+double monotonic_now_sec();
+
+bool running_under_rr();
+
+std::vector<std::string> read_proc_status_fields(pid_t tid, const char* name,
+                                                 const char* name2 = nullptr,
+                                                 const char* name3 = nullptr);
+
+/**
+ * Mainline Linux kernels use an invisible (to /proc/<pid>/maps) guard page
+ * for stacks. grsecurity kernels don't.
+ */
+bool uses_invisible_guard_page();
+
+void copy_file(Task* t, int dest_fd, int src_fd);
+
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+extern "C" void __msan_unpoison(void*, size_t);
+inline void msan_unpoison(void* ptr, size_t n) { __msan_unpoison(ptr, n); };
+#else
+inline void msan_unpoison(void* ptr, size_t n) {
+  (void)ptr;
+  (void)n;
+};
+#endif
+#else
+inline void msan_unpoison(void* ptr, size_t n) {
+  (void)ptr;
+  (void)n;
+};
+#endif
+
+/**
+ * Allocate new memory of |size| in bytes. The pointer returned is never NULL.
+ * This calls aborts the program if the host runs out of memory.
+ */
+void* xmalloc(size_t size);
+
+/**
+ * Determine if the given capabilities are a subset of the process' current
+ * active capabilities.
+ */
+bool has_effective_caps(uint64_t caps);
+
+/**
+ * Determine the size of the xsave area
+ */
+unsigned int xsave_area_size();
+
+inline uint64_t signal_bit(int sig) { return uint64_t(1) << (sig - 1); }
+
+uint64_t rr_signal_mask();
+
+enum ProbePort { DONT_PROBE = 0, PROBE_PORT };
+
+ScopedFd open_socket(const char* address, unsigned short* port,
+                     ProbePort probe);
+
+/**
+ * Like `abort`, but tries to wake up test-monitor for a snapshot if possible.
+ */
+void notifying_abort();
+
+/**
+ * Check for leaked mappings etc
+ */
+void check_for_leaks();
+
+/**
+ * Returns $TMPDIR or "/tmp".
+ */
+const char* tmp_dir();
+
+struct TempFile {
+  std::string name;
+  ScopedFd fd;
+};
+
+/**
+ * `pattern is an mkstemp pattern minus any leading path. We'll choose the
+ * temp directory ourselves. The file is not automatically deleted, the caller
+ * must take care of that.
+ */
+TempFile create_temporary_file(const char* pattern);
+
+void good_random(void* out, size_t out_len);
+
+std::vector<std::string> current_env();
+
+} // namespace rr
 
 #endif /* RR_UTIL_H_ */

@@ -5,6 +5,8 @@
 
 #include "FileMonitor.h"
 
+namespace rr {
+
 /**
  * A FileMonitor to track writes to rr's stdout/stderr fds.
  * StdioMonitor prevents syscallbuf from buffering output to those fds. It
@@ -20,6 +22,8 @@ public:
    */
   StdioMonitor(int original_fd) : original_fd(original_fd) {}
 
+  virtual Type type() override { return Stdio; }
+
   /**
    * Make writes to stdout/stderr blocking, to avoid nondeterminism in the
    * order in which the kernel actually performs such writes.
@@ -31,15 +35,18 @@ public:
    * "[rr <pid> <global-time>]".  This allows users to more easily correlate
    * stdio with trace event numbers.
    */
-  virtual Switchable will_write(Task* t);
+  virtual Switchable will_write(Task* t) override;
 
   /**
    * During replay, echo writes to stdout/stderr.
    */
-  virtual void did_write(Task* t, const std::vector<Range>& ranges);
+  virtual void did_write(Task* t, const std::vector<Range>& ranges,
+                         LazyOffset&) override;
 
 private:
   int original_fd;
 };
+
+} // namespace rr
 
 #endif /* RR_STDIO_MONITOR_H_ */

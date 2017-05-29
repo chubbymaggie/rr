@@ -1,7 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "Signal"
-
 #include "record_signal.h"
 
 #include <assert.h>
@@ -10,61 +8,81 @@
 #include <sched.h>
 #include <stdlib.h>
 #include <string.h>
-#include <syscall.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/user.h>
+#include <syscall.h>
 #include <x86intrin.h>
 
 #include "preload/preload_interface.h"
 
 #include "AutoRemoteSyscalls.h"
 #include "Flags.h"
-#include "kernel_metadata.h"
-#include "log.h"
 #include "PerfCounters.h"
 #include "RecordSession.h"
-#include "task.h"
+#include "RecordTask.h"
 #include "TraceStream.h"
+#include "kernel_metadata.h"
+#include "log.h"
 #include "util.h"
 
-using namespace rr;
 using namespace std;
+
+namespace rr {
 
 static __inline__ unsigned long long rdtsc(void) { return __rdtsc(); }
 
-static const int STOPSIG_SYSCALL = 0x80 | SIGTRAP;
-
 template <typename Arch> static size_t sigaction_sigset_size_arch() {
-  return Arch::sigaction_sigset_size;
+  return sizeof(typename Arch::kernel_sigset_t);
 }
 
 static size_t sigaction_sigset_size(SupportedArch arch) {
   RR_ARCH_FUNCTION(sigaction_sigset_size_arch, arch);
 }
 
-/**
- * Restore the blocked-ness and sigaction for SIGSEGV from |t|'s local
- * copy.
- */
-static void restore_sigsegv_state(Task* t) {
-  const vector<uint8_t>& sa = t->signal_action(SIGSEGV);
-  AutoRemoteSyscalls remote(t);
-  {
+static void restore_sighandler_if_not_default(RecordTask* t, int sig) {
+  if (t->sig_disposition(sig) != SIGNAL_DEFAULT) {
+    LOG(debug) << "Restoring signal handler for " << signal_name(sig);
+    AutoRemoteSyscalls remote(t);
+    size_t sigset_size = sigaction_sigset_size(remote.arch());
+    const vector<uint8_t>& sa = t->signal_action(sig);
     AutoRestoreMem child_sa(remote, sa.data(), sa.size());
     remote.infallible_syscall(syscall_number_for_rt_sigaction(remote.arch()),
-                              SIGSEGV, child_sa.get().as_int(), nullptr,
-                              sigaction_sigset_size(remote.arch()));
+                              sig, child_sa.get().as_int(), nullptr,
+                              sigset_size);
   }
-  // NB: we would normally want to restore the SIG_BLOCK for
-  // SIGSEGV here, but doing so doesn't change the kernel's
-  // "SigBlk" mask.  There's no bug observed in the kernel's
-  // delivery of SIGSEGV after the RDTSC trap, so we do nothing
-  // here and move on.
+}
+
+/**
+ * Restore the blocked-ness and sigaction for |sig| from |t|'s local
+ * copy.
+ */
+static void restore_signal_state(RecordTask* t, int sig,
+                                 SignalBlocked signal_was_blocked) {
+  restore_sighandler_if_not_default(t, sig);
+  if (signal_was_blocked) {
+    LOG(debug) << "Restoring signal blocked-ness for " << signal_name(sig);
+    AutoRemoteSyscalls remote(t);
+    size_t sigset_size = sigaction_sigset_size(remote.arch());
+    vector<uint8_t> bytes;
+    bytes.resize(sigset_size);
+    memset(bytes.data(), 0, sigset_size);
+    uint64_t mask = signal_bit(sig);
+    ASSERT(t, sigset_size >= sizeof(mask));
+    memcpy(bytes.data(), &mask, sizeof(mask));
+    AutoRestoreMem child_block(remote, bytes.data(), bytes.size());
+    remote.infallible_syscall(syscall_number_for_rt_sigprocmask(remote.arch()),
+                              SIG_BLOCK, child_block.get().as_int(), nullptr,
+                              sigset_size);
+    // We just changed the sigmask ourselves.
+    t->invalidate_sigmask();
+  }
 }
 
 /** Return true iff |t->ip()| points at a RDTSC instruction. */
 static const uint8_t rdtsc_insn[] = { 0x0f, 0x31 };
-static bool is_ip_rdtsc(Task* t) {
+static bool is_ip_rdtsc(RecordTask* t) {
   uint8_t insn[sizeof(rdtsc_insn)];
   if (sizeof(insn) !=
       t->read_bytes_fallible(t->ip().to_data_ptr<uint8_t>(), sizeof(insn),
@@ -78,10 +96,10 @@ static bool is_ip_rdtsc(Task* t) {
  * Return true if |t| was stopped because of a SIGSEGV resulting
  * from a rdtsc and |t| was updated appropriately, false otherwise.
  */
-static bool try_handle_rdtsc(Task* t, siginfo_t* si) {
+static bool try_handle_rdtsc(RecordTask* t, siginfo_t* si) {
   ASSERT(t, si->si_signo == SIGSEGV);
 
-  if (!is_ip_rdtsc(t)) {
+  if (!is_ip_rdtsc(t) || t->tsc_mode == PR_TSC_SIGSEGV) {
     return false;
   }
 
@@ -100,72 +118,182 @@ static bool try_handle_rdtsc(Task* t, siginfo_t* si) {
  * Return true if |t| was stopped because of a SIGSEGV and we want to retry
  * the instruction after emulating MAP_GROWSDOWN.
  */
-static bool try_grow_map(Task* t, siginfo_t* si) {
+static bool try_grow_map(RecordTask* t, siginfo_t* si) {
   ASSERT(t, si->si_signo == SIGSEGV);
 
   // Use kernel_abi to avoid odd inconsistencies between distros
   auto arch_si = reinterpret_cast<NativeArch::siginfo_t*>(si);
   auto addr = arch_si->_sifields._sigfault.si_addr_.rptr();
 
-  auto maps = t->vm()->maps_starting_at(floor_page_size(addr));
-  auto it = maps.begin();
-  if (it == maps.end() || addr >= it->map.start() ||
-      !(it->map.flags() & MAP_GROWSDOWN)) {
+  if (t->vm()->has_mapping(addr)) {
+    LOG(debug) << "try_grow_map " << addr << ": address already mapped";
     return false;
   }
-
-  auto new_start = floor_page_size(addr);
-  static const uintptr_t grow_size = 0x10000;
-  if (it->map.start().as_int() >= grow_size) {
-    auto possible_new_start = std::min(new_start, it->map.start() - grow_size);
-    auto earlier_maps = t->vm()->maps_starting_at(possible_new_start);
-    if (earlier_maps.begin()->map.start() == it->map.start()) {
-      // No intervening map
-      new_start = possible_new_start;
-    }
+  auto maps = t->vm()->maps_starting_at(floor_page_size(addr));
+  auto it = maps.begin();
+  if (it == maps.end()) {
+    LOG(debug) << "try_grow_map " << addr << ": no later map to grow downward";
+    return false;
   }
-
+  if (!(it->map.flags() & MAP_GROWSDOWN)) {
+    LOG(debug) << "try_grow_map " << addr << ": map is not MAP_GROWSDOWN ("
+               << it->map << ")";
+    return false;
+  }
+  if (addr >= page_size() && t->vm()->has_mapping(addr - page_size())) {
+    LOG(debug) << "try_grow_map " << addr << ": address would be in guard page";
+    return false;
+  }
   struct rlimit stack_limit;
+  remote_ptr<void> limit_bottom;
   int ret = prlimit(t->tid, RLIMIT_STACK, NULL, &stack_limit);
   if (ret >= 0 && stack_limit.rlim_cur != RLIM_INFINITY) {
-    new_start = std::max(new_start,
-                         ceil_page_size(it->map.end() - stack_limit.rlim_cur));
-    if (new_start > addr) {
+    limit_bottom = ceil_page_size(it->map.end() - stack_limit.rlim_cur);
+    if (limit_bottom > addr) {
+      LOG(debug) << "try_grow_map " << addr << ": RLIMIT_STACK exceeded";
       return false;
     }
   }
+
+  // Try to grow by 64K at a time to reduce signal frequency.
+  auto new_start = floor_page_size(addr);
+  static const uintptr_t grow_size = 0x10000;
+  if (it->map.start().as_int() >= grow_size) {
+    auto possible_new_start = std::max(
+        limit_bottom, std::min(new_start, it->map.start() - grow_size));
+    // Ensure that no mapping exists between possible_new_start - page_size()
+    // and new_start. If there is, possible_new_start is not valid, in which
+    // case we just abandon the optimization.
+    if (possible_new_start >= page_size() &&
+        !t->vm()->has_mapping(possible_new_start - page_size()) &&
+        t->vm()->maps_starting_at(possible_new_start - page_size())
+                .begin()
+                ->map.start() == it->map.start()) {
+      new_start = possible_new_start;
+    }
+  }
+  LOG(debug) << "try_grow_map " << addr << ": trying to grow map " << it->map;
 
   {
     AutoRemoteSyscalls remote(t, AutoRemoteSyscalls::DISABLE_MEMORY_PARAMS);
     remote.infallible_mmap_syscall(
         new_start, it->map.start() - new_start, it->map.prot(),
-        (it->map.flags() & ~MAP_GROWSDOWN) | MAP_ANONYMOUS, -1, 0);
+        (it->map.flags() & ~MAP_GROWSDOWN) | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
   }
 
   KernelMapping km =
-      t->vm()->map(new_start, it->map.start() - new_start, it->map.prot(),
+      t->vm()->map(t, new_start, it->map.start() - new_start, it->map.prot(),
                    it->map.flags() | MAP_ANONYMOUS, 0, string(),
                    KernelMapping::NO_DEVICE, KernelMapping::NO_INODE);
-  t->trace_writer().write_mapped_region(km, km.fake_stat());
+  t->trace_writer().write_mapped_region(t, km, km.fake_stat());
   // No need to flush syscallbuf here. It's safe to map these pages "early"
   // before they're really needed.
   t->record_event(Event(EV_GROW_MAP, NO_EXEC_INFO, t->arch()),
-                  Task::DONT_FLUSH_SYSCALLBUF);
+                  RecordTask::DONT_FLUSH_SYSCALLBUF);
   t->push_event(Event::noop(t->arch()));
-  LOG(debug) << "  trapped for MAP_GROWSDOWN";
+  LOG(debug) << "try_grow_map " << addr << ": extended map "
+             << t->vm()->mapping_of(addr).map;
   return true;
 }
 
-void disarm_desched_event(Task* t) {
+void disarm_desched_event(RecordTask* t) {
   if (ioctl(t->desched_fd, PERF_EVENT_IOC_DISABLE, 0)) {
     FATAL() << "Failed to disarm desched event";
   }
 }
 
-void arm_desched_event(Task* t) {
+void arm_desched_event(RecordTask* t) {
   if (ioctl(t->desched_fd, PERF_EVENT_IOC_ENABLE, 0)) {
     FATAL() << "Failed to disarm desched event";
   }
+}
+
+template <typename Arch>
+static remote_code_ptr get_stub_scratch_1_arch(RecordTask* t) {
+  auto locals = t->read_mem(AddressSpace::preload_thread_locals_start()
+                                .cast<preload_thread_locals<Arch>>());
+  return locals.stub_scratch_1.rptr().as_int();
+}
+
+static remote_code_ptr get_stub_scratch_1(RecordTask* t) {
+  RR_ARCH_FUNCTION(get_stub_scratch_1_arch, t->arch(), t);
+}
+
+/**
+ * This function is responsible for handling breakpoints we set in syscallbuf
+ * code to detect sigprocmask calls and syscallbuf exit. It's called when we
+ * get a SIGTRAP. Returns true if the SIGTRAP was called by one of our
+ * breakpoints and should be hidden from the application.
+ * If it was triggered by one of our breakpoints, we have to call
+ * restore_sighandler_if_not_default(t, SIGTRAP) to make sure the SIGTRAP
+ * handler is properly restored if the kernel cleared it.
+ */
+bool handle_syscallbuf_breakpoint(RecordTask* t) {
+  if (t->is_at_syscallbuf_final_instruction_breakpoint()) {
+    LOG(debug) << "Reached final syscallbuf instruction, singlestepping to "
+                  "enable signal dispatch";
+    // This is a single instruction that jumps to the location stored in
+    // preload_thread_locals::stub_scratch_1. Emulate it.
+    Registers r = t->regs();
+    r.set_ip(get_stub_scratch_1(t));
+    t->set_regs(r);
+
+    restore_sighandler_if_not_default(t, SIGTRAP);
+    // Now we're back in application code so any pending stashed signals
+    // will be handled.
+    return true;
+  }
+
+  if (!t->is_at_syscallbuf_syscall_entry_breakpoint()) {
+    return false;
+  }
+
+  Registers r = t->regs();
+  r.set_ip(r.ip().decrement_by_bkpt_insn_length(t->arch()));
+  t->set_regs(r);
+
+  if (t->is_at_traced_syscall_entry()) {
+    // We will automatically dispatch stashed signals now since this is an
+    // allowed place to dispatch signals.
+    LOG(debug) << "Allowing signal dispatch at traced-syscall breakpoint";
+    restore_sighandler_if_not_default(t, SIGTRAP);
+    return true;
+  }
+
+  // We're at an untraced-syscall entry point.
+  // To allow an AutoRemoteSyscall, we need to make sure desched signals are
+  // disarmed (and rearmed afterward).
+  bool armed_desched_event = t->read_mem(
+      REMOTE_PTR_FIELD(t->syscallbuf_child, desched_signal_may_be_relevant));
+  if (armed_desched_event) {
+    disarm_desched_event(t);
+  }
+  restore_sighandler_if_not_default(t, SIGTRAP);
+  if (armed_desched_event) {
+    arm_desched_event(t);
+  }
+
+  // This is definitely a native-arch syscall.
+  if (is_rt_sigprocmask_syscall(r.syscallno(), t->arch())) {
+    // Don't proceed with this syscall. Emulate it returning EAGAIN.
+    // Syscallbuf logic will retry using a traced syscall instead.
+    r.set_syscall_result(-EAGAIN);
+    r.set_ip(r.ip().increment_by_syscall_insn_length(t->arch()));
+    t->canonicalize_and_set_regs(r, t->arch());
+    LOG(debug) << "Emulated EAGAIN to avoid untraced sigprocmask with pending "
+                  "stashed signal";
+    // Leave breakpoints enabled since we want to break at the traced-syscall
+    // fallback for rt_sigprocmask.
+    return true;
+  }
+
+  // We can proceed with the untraced syscall. Either it will complete and
+  // execution will continue until we reach some point where we can deliver our
+  // signal, or it will block at which point we'll be able to deliver our
+  // signal.
+  LOG(debug) << "Disabling breakpoints at untraced syscalls";
+  t->break_at_syscallbuf_untraced_syscalls = false;
+  return true;
 }
 
 /**
@@ -173,11 +301,10 @@ void arm_desched_event(Task* t) {
  * The tracee's execution may be advanced, and if so |regs| is updated
  * to the tracee's latest state.
  */
-static void handle_desched_event(Task* t, const siginfo_t* si) {
+static void handle_desched_event(RecordTask* t, const siginfo_t* si) {
   ASSERT(t, (SYSCALLBUF_DESCHED_SIGNAL == si->si_signo &&
              si->si_code == POLL_IN && si->si_fd == t->desched_fd_child))
-      << "Tracee is using SIGPWR??? (code=" << si->si_code
-      << ", fd=" << si->si_fd << ")";
+      << "Tracee is using SIGPWR??? (siginfo=" << *si << ")";
 
   /* If the tracee isn't in the critical section where a desched
    * event is relevant, we can ignore it.  See the long comments
@@ -192,7 +319,8 @@ static void handle_desched_event(Task* t, const siginfo_t* si) {
    * the desched_signal_may_be_relevant was set by the outermost syscallbuf
    * invocation.
    */
-  if (!t->syscallbuf_hdr->desched_signal_may_be_relevant ||
+  if (!t->read_mem(REMOTE_PTR_FIELD(t->syscallbuf_child,
+                                    desched_signal_may_be_relevant)) ||
       t->running_inside_desched()) {
     LOG(debug) << "  (not entering may-block syscall; resuming)";
     /* We have to disarm the event just in case the tracee
@@ -273,14 +401,14 @@ static void handle_desched_event(Task* t, const siginfo_t* si) {
     disarm_desched_event(t);
 
     t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_UNLIMITED_TICKS);
-    int sig = t->stop_sig();
 
-    if (STOPSIG_SYSCALL == sig) {
+    if (t->status().is_syscall()) {
       if (t->is_arm_desched_event_syscall()) {
         continue;
       }
       break;
     }
+
     // Completely ignore spurious desched signals and
     // signals that aren't going to be delivered to the
     // tracee.
@@ -295,6 +423,14 @@ static void handle_desched_event(Task* t, const siginfo_t* si) {
     // TODO: it's theoretically possible for this to
     // happen an unbounded number of consecutive times
     // and the tracee never switched out.
+    int sig = t->stop_sig();
+    ASSERT(t, sig) << "expected stop-signal, got " << t->status();
+    if (SIGTRAP == sig && handle_syscallbuf_breakpoint(t)) {
+      // We stopped at a breakpoint on an untraced may-block syscall.
+      // This can't be relevant to us since sigprocmask isn't may-block.
+      LOG(debug) << " disabling breakpoints on untraced syscalls";
+      continue;
+    }
     if (SYSCALLBUF_DESCHED_SIGNAL == sig ||
         PerfCounters::TIME_SLICE_SIGNAL == sig || t->is_sig_ignored(sig)) {
       LOG(debug) << "  dropping ignored " << signal_name(sig);
@@ -321,16 +457,17 @@ static void handle_desched_event(Task* t, const siginfo_t* si) {
      * reset until we've finished guiding the tracee through this
      * interrupted call.  We use the record counter for
      * assertions. */
+    ASSERT(t, !t->delay_syscallbuf_reset);
     t->delay_syscallbuf_reset = true;
 
     /* The tracee is (re-)entering the buffered syscall.  Stash
      * away this breadcrumb so that we can figure out what syscall
      * the tracee was in, and how much "scratch" space it carved
      * off the syscallbuf, if needed. */
-    const struct syscallbuf_record* desched_rec =
-        next_record(t->syscallbuf_hdr);
+    remote_ptr<const struct syscallbuf_record> desched_rec =
+        t->next_syscallbuf_record();
     t->push_event(DeschedEvent(desched_rec, t->arch()));
-    int call = t->desched_rec()->syscallno;
+    int call = t->read_mem(REMOTE_PTR_FIELD(t->desched_rec(), syscallno));
 
     /* The descheduled syscall was interrupted by a signal, like
      * all other may-restart syscalls, with the exception that
@@ -349,52 +486,111 @@ static void handle_desched_event(Task* t, const siginfo_t* si) {
    * otherwise we'll get a divergence during replay, which will not
    * encounter this problem.
    */
-  int call = t->desched_rec()->syscallno;
+  int call = t->read_mem(REMOTE_PTR_FIELD(t->desched_rec(), syscallno));
   ev.regs.set_original_syscallno(call);
   t->set_regs(ev.regs);
-  ev.state = EXITING_SYSCALL;
+  // runnable_state_changed will observe us entering this syscall and change
+  // state to ENTERING_SYSCALL
 
   LOG(debug) << "  resuming (and probably switching out) blocked `"
              << t->syscall_name(call) << "'";
 }
 
-static bool is_safe_to_deliver_signal(Task* t) {
-  struct syscallbuf_hdr* hdr = t->syscallbuf_hdr;
-
-  if (!hdr) {
-    /* Can't be in critical section because the lock
-     * doesn't exist yet! */
-    return true;
-  }
-
+static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si) {
   if (!t->is_in_syscallbuf()) {
     /* The tracee is outside the syscallbuf code,
      * so in most cases can't possibly affect
      * syscallbuf critical sections.  The
      * exception is signal handlers "re-entering"
      * desched'd syscalls, which are OK. */
+    LOG(debug) << "Safe to deliver signal at " << t->ip()
+               << " because not in syscallbuf";
     return true;
   }
 
   if (t->is_in_traced_syscall()) {
-    LOG(debug) << "  tracee at traced syscallbuf syscall";
+    LOG(debug) << "Safe to deliver signal at " << t->ip()
+               << " because in traced syscall";
+    return true;
+  }
+  if (t->is_at_traced_syscall_entry()) {
+    LOG(debug) << "Safe to deliver signal at " << t->ip()
+               << " because at entry to traced syscall";
     return true;
   }
 
   if (t->is_in_untraced_syscall() && t->desched_rec()) {
-    LOG(debug) << "  tracee interrupted by desched of "
-               << t->syscall_name(t->desched_rec()->syscallno);
+    LOG(debug) << "Safe to deliver signal at " << t->ip()
+               << " because tracee interrupted by desched of "
+               << t->syscall_name(t->read_mem(
+                      REMOTE_PTR_FIELD(t->desched_rec(), syscallno)));
     return true;
   }
 
-  // Our emulation of SYS_rrcall_notify_syscall_hook_exit clears this flag.
-  hdr->notify_on_syscall_hook_exit = true;
+  if (t->is_in_untraced_syscall() && si->si_signo == SIGSYS &&
+      si->si_code == SYS_SECCOMP) {
+    LOG(debug) << "Safe to deliver signal at " << t->ip()
+               << " because signal is seccomp trap.";
+    return true;
+  }
+
+  // If the syscallbuf buffer hasn't been created yet, just delay the signal
+  // with no need to set notify_on_syscall_hook_exit; the signal will be
+  // delivered when rrcall_init_buffers is called.
+  if (t->syscallbuf_child) {
+    if (t->read_mem(REMOTE_PTR_FIELD(t->syscallbuf_child, locked)) & 2) {
+      LOG(debug) << "Safe to deliver signal at " << t->ip()
+                 << " because the syscallbuf is locked";
+      return true;
+    }
+
+    // A signal (e.g. seccomp SIGSYS) interrupted a untraced syscall in a
+    // non-restartable way. Defer it until SYS_rrcall_notify_syscall_hook_exit.
+    if (t->is_in_untraced_syscall()) {
+      // Our emulation of SYS_rrcall_notify_syscall_hook_exit clears this flag.
+      t->write_mem(
+          REMOTE_PTR_FIELD(t->syscallbuf_child, notify_on_syscall_hook_exit),
+          (uint8_t)1);
+    }
+  }
+
+  LOG(debug) << "Not safe to deliver signal at " << t->ip();
   return false;
 }
 
-SignalHandled handle_signal(Task* t, siginfo_t* si) {
-  LOG(debug) << t->tid << ": handling signal " << signal_name(si->si_signo)
-             << " (pevent: " << t->ptrace_event() << ", event: " << t->ev();
+SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
+                            SignalDeterministic deterministic,
+                            SignalBlocked signal_was_blocked) {
+  int sig = si->si_signo;
+  LOG(debug) << t->tid << ": handling signal " << signal_name(sig)
+             << " (pevent: " << ptrace_event_name(t->ptrace_event())
+             << ", event: " << t->ev();
+
+  // Conservatively invalidate the sigmask in case just accepting a signal has
+  // sigmask effects.
+  t->invalidate_sigmask();
+
+  if (deterministic == DETERMINISTIC_SIG) {
+    // When a deterministic signal is triggered, but the signal is currently
+    // blocked or ignored, the kernel (in |force_sig_info|) unblocks it and
+    // sets its disposition to SIG_DFL. It never undoes this (probably
+    // because it expects the signal to be fatal, which it always would be
+    // unless a ptracer intercepts the signal as we do). Therefore, if the
+    // signal was generated for rr's purposes, we need to restore the signal
+    // state ourselves.
+    if (sig == SIGSEGV && (try_handle_rdtsc(t, si) || try_grow_map(t, si))) {
+      if (signal_was_blocked || t->is_sig_ignored(sig)) {
+        restore_signal_state(t, sig, signal_was_blocked);
+      }
+      return SIGNAL_HANDLED;
+    }
+
+    // Since we're not undoing the kernel's changes, update our signal handler
+    // state to match the kernel's.
+    if (signal_was_blocked || t->is_sig_ignored(sig)) {
+      t->set_sig_handler_default(sig);
+    }
+  }
 
   /* We have to check for a desched event first, because for
    * those we *do not* want to (and cannot, most of the time)
@@ -405,63 +601,47 @@ SignalHandled handle_signal(Task* t, siginfo_t* si) {
     return SIGNAL_HANDLED;
   }
 
-  if (!is_safe_to_deliver_signal(t)) {
+  if (!is_safe_to_deliver_signal(t, si)) {
     return DEFER_SIGNAL;
   }
 
-  t->set_siginfo_for_synthetic_SIGCHLD(si);
+  if (!t->set_siginfo_for_synthetic_SIGCHLD(si)) {
+    return DEFER_SIGNAL;
+  }
 
-  /* See if this signal occurred because of an rr implementation detail,
-   * and fudge t appropriately. */
-  switch (si->si_signo) {
-    case SIGSEGV:
-      if (try_handle_rdtsc(t, si) || try_grow_map(t, si)) {
-        // When SIGSEGV is blocked, apparently the kernel has to do
-        // some ninjutsu to raise the trap.  We see the SIGSEGV
-        // bit in the "SigBlk" mask in /proc/status cleared, and if
-        // there's a user handler the SIGSEGV bit in "SigCgt" is
-        // cleared too.  That's perfectly fine, except that it's
-        // unclear who's supposed to undo the signal-state munging.  A
-        // legitimate argument can be made that the tracer is
-        // responsible, so we go ahead and restore the old state.
-        //
-        // One could also argue that this is a kernel bug.  If so,
-        // then this is a workaround that can be removed in the
-        // future.
-        //
-        // If we don't restore the old state, at least firefox has
-        // been observed to hang at delivery of SIGSEGV.  However, the
-        // test written for this bug, fault_in_code_addr, doesn't hang
-        // without the restore.
-        if (t->is_sig_blocked(SIGSEGV)) {
-          restore_sigsegv_state(t);
-        }
-        return SIGNAL_HANDLED;
-      }
-      break;
-
-    case PerfCounters::TIME_SLICE_SIGNAL:
-      t->push_event(Event(EV_SCHED, HAS_EXEC_INFO, t->arch()));
-      return SIGNAL_HANDLED;
+  if (sig == PerfCounters::TIME_SLICE_SIGNAL) {
+    t->push_event(Event(EV_SCHED, HAS_EXEC_INFO, t->arch()));
+    return SIGNAL_HANDLED;
   }
 
   /* This signal was generated by the program or an external
    * source, record it normally. */
 
-  if (t->emulate_ptrace_stop((si->si_signo << 8) | 0x7f,
-                             SIGNAL_DELIVERY_STOP)) {
-    t->save_ptrace_signal_siginfo(*si);
-    // Record a SCHED event so that replay progresses the tracee to the
+  if (t->emulate_ptrace_stop(WaitStatus::for_stop_sig(sig), si)) {
+    // Record an event so that replay progresses the tracee to the
     // current point before we notify the tracer.
-    t->push_event(Event(EV_SCHED, HAS_EXEC_INFO, t->arch()));
-    t->record_current_event();
-    t->pop_event(EV_SCHED);
+    // If the signal is deterministic, record it as an EV_SIGNAL so that
+    // we replay it using the deterministic-signal replay path. This is
+    // more efficient than emulate_async_signal. Also emulate_async_signal
+    // currently assumes it won't encounter a deterministic SIGTRAP (due to
+    // a hardcoded breakpoint in the tracee).
+    if (deterministic == DETERMINISTIC_SIG) {
+      t->push_event(SignalEvent(*si, deterministic, t));
+      t->record_current_event();
+      t->pop_event(EV_SIGNAL);
+    } else {
+      t->push_event(Event(EV_SCHED, HAS_EXEC_INFO, t->arch()));
+      t->record_current_event();
+      t->pop_event(EV_SCHED);
+    }
     // ptracer has been notified, so don't deliver the signal now.
     // The signal won't be delivered for real until the ptracer calls
     // PTRACE_CONT with the signal number (which we don't support yet!).
     return SIGNAL_PTRACE_STOP;
   }
 
-  t->push_event(SignalEvent(*si, t->arch()));
+  t->push_event(SignalEvent(*si, deterministic, t));
   return SIGNAL_HANDLED;
 }
+
+} // namespace rr

@@ -1,7 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "CompressedReader"
-
 #define _LARGEFILE64_SOURCE
 
 #include "CompressedReader.h"
@@ -10,18 +8,27 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <string.h>
-#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <zlib.h>
 
 #include "CompressedWriter.h"
 
-CompressedReader::CompressedReader(const std::string& filename)
+using namespace std;
+
+namespace rr {
+
+CompressedReader::CompressedReader(const string& filename)
     : fd(new ScopedFd(filename.c_str(), O_CLOEXEC | O_RDONLY | O_LARGEFILE)) {
   fd_offset = 0;
   error = !fd->is_open();
-  eof = false;
+  if (error) {
+    eof = false;
+  } else {
+    char ch;
+    eof = pread(*fd, &ch, 1, fd_offset) == 0;
+  }
   buffer_read_pos = 0;
   have_saved_state = false;
 }
@@ -176,3 +183,5 @@ uint64_t CompressedReader::uncompressed_bytes() const {
 uint64_t CompressedReader::compressed_bytes() const {
   return lseek(*fd, 0, SEEK_END);
 }
+
+} // namespace rr

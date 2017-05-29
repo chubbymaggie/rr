@@ -4,16 +4,18 @@
 
 #include <assert.h>
 #include <errno.h>
-#include <sys/ptrace.h>
+#include <linux/shm.h>
 #include <signal.h>
+#include <sys/ptrace.h>
 #include <syscall.h>
 
 #include "kernel_abi.h"
 #include "kernel_supplement.h"
 #include "log.h"
 
-using namespace rr;
 using namespace std;
+
+namespace rr {
 
 #include "SyscallnameArch.generated"
 
@@ -25,7 +27,7 @@ string syscall_name(int syscall, SupportedArch arch) {
   case _id:                                                                    \
     return #_id;
 
-const char* ptrace_event_name(int event) {
+string ptrace_event_name(int event) {
   switch (event) {
     CASE(PTRACE_EVENT_FORK);
     CASE(PTRACE_EVENT_VFORK);
@@ -39,13 +41,16 @@ const char* ptrace_event_name(int event) {
     CASE(PTRACE_EVENT_SECCOMP_OBSOLETE);
     CASE(PTRACE_EVENT_SECCOMP);
     CASE(PTRACE_EVENT_STOP);
-    default:
-      return "???PTRACE_EVENT";
+    default: {
+      char buf[100];
+      sprintf(buf, "PTRACE_EVENT(%d)", event);
+      return string(buf);
+    }
   }
 }
 
-const char* ptrace_req_name(int request) {
-  switch (int(request)) {
+string ptrace_req_name(int request) {
+  switch (request) {
     CASE(PTRACE_TRACEME);
     CASE(PTRACE_PEEKTEXT);
     CASE(PTRACE_PEEKDATA);
@@ -77,15 +82,18 @@ const char* ptrace_req_name(int request) {
     // These aren't part of the official ptrace-request enum.
     CASE(PTRACE_SYSEMU);
     CASE(PTRACE_SYSEMU_SINGLESTEP);
-    default:
-      return "???PTRACE_REQ";
+    default: {
+      char buf[100];
+      sprintf(buf, "PTRACE_REQUEST(%d)", request);
+      return string(buf);
+    }
   }
 }
 
-const char* signal_name(int sig) {
+string signal_name(int sig) {
   /* strsignal() would be nice to use here, but it provides TMI. */
   if (32 <= sig && sig <= 64) {
-    static __thread char buf[] = "SIGRT00000000";
+    char buf[100];
     snprintf(buf, sizeof(buf) - 1, "SIGRT%d", sig);
     return buf;
   }
@@ -122,8 +130,11 @@ const char* signal_name(int sig) {
     CASE(SIGIO);
     CASE(SIGPWR);
     CASE(SIGSYS);
-    default:
-      return "???signal";
+    default: {
+      char buf[100];
+      sprintf(buf, "signal(%d)", sig);
+      return string(buf);
+    }
   }
 }
 
@@ -275,7 +286,7 @@ string errno_name(int err) {
   }
 }
 
-const char* sicode_name(int code, int sig) {
+string sicode_name(int code, int sig) {
   switch (code) {
     CASE(SI_USER);
     CASE(SI_KERNEL);
@@ -285,6 +296,7 @@ const char* sicode_name(int code, int sig) {
     CASE(SI_ASYNCIO);
     CASE(SI_SIGIO);
     CASE(SI_TKILL);
+    CASE(SI_ASYNCNL);
   }
 
   switch (sig) {
@@ -293,14 +305,71 @@ const char* sicode_name(int code, int sig) {
         CASE(SEGV_MAPERR);
         CASE(SEGV_ACCERR);
       }
+      break;
     case SIGTRAP:
       switch (code) {
         CASE(TRAP_BRKPT);
         CASE(TRAP_TRACE);
       }
+      break;
+    case SIGILL:
+      switch (code) {
+        CASE(ILL_ILLOPC);
+        CASE(ILL_ILLOPN);
+        CASE(ILL_ILLADR);
+        CASE(ILL_ILLTRP);
+        CASE(ILL_PRVOPC);
+        CASE(ILL_PRVREG);
+        CASE(ILL_COPROC);
+        CASE(ILL_BADSTK);
+      }
+      break;
+    case SIGFPE:
+      switch (code) {
+        CASE(FPE_INTDIV);
+        CASE(FPE_INTOVF);
+        CASE(FPE_FLTDIV);
+        CASE(FPE_FLTOVF);
+        CASE(FPE_FLTUND);
+        CASE(FPE_FLTRES);
+        CASE(FPE_FLTINV);
+        CASE(FPE_FLTSUB);
+      }
+      break;
+    case SIGBUS:
+      switch (code) {
+        CASE(BUS_ADRALN);
+        CASE(BUS_ADRERR);
+        CASE(BUS_OBJERR);
+        CASE(BUS_MCEERR_AR);
+        CASE(BUS_MCEERR_AO);
+      }
+      break;
+    case SIGCHLD:
+      switch (code) {
+        CASE(CLD_EXITED);
+        CASE(CLD_KILLED);
+        CASE(CLD_DUMPED);
+        CASE(CLD_TRAPPED);
+        CASE(CLD_STOPPED);
+        CASE(CLD_CONTINUED);
+      }
+      break;
+    case SIGPOLL:
+      switch (code) {
+        CASE(POLL_IN);
+        CASE(POLL_OUT);
+        CASE(POLL_MSG);
+        CASE(POLL_ERR);
+        CASE(POLL_PRI);
+        CASE(POLL_HUP);
+      }
+      break;
   }
 
-  return "???sicode";
+  char buf[100];
+  sprintf(buf, "sicode(%d)", code);
+  return string(buf);
 }
 
 std::ostream& operator<<(std::ostream& stream, const siginfo_t& siginfo) {
@@ -324,3 +393,5 @@ int shm_flags_to_mmap_prot(int flags) {
   return PROT_READ | ((flags & SHM_RDONLY) ? 0 : PROT_WRITE) |
          ((flags & SHM_EXEC) ? PROT_EXEC : 0);
 }
+
+} // namespace rr

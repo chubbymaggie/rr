@@ -29,7 +29,7 @@ static void find_home_device(void) {
              &min, home_device);
     }
     if (maj == (int)major(home_stat.st_dev) &&
-        min == (int)minor(home_stat.st_dev)) {
+        min == (int)minor(home_stat.st_dev) && maj != 0) {
       atomic_printf("%s (%d:%d) is on device special file %s\n", home, maj, min,
                     home_device);
       return;
@@ -46,6 +46,20 @@ int main(void) {
   struct dqblk dq;
   int ret;
 
+  /* ENOTBLK returned before checking cmd */
+  ret = quotactl(0x12345678, "/", getuid(), (caddr_t)&dq);
+  test_assert(ret < 0 && errno == ENOTBLK);
+
+  /* ENOENT returned before checking cmd */
+  ret =
+      quotactl(0x12345678, "/asdfjlafdlkk289892389pkj", getuid(), (caddr_t)&dq);
+  test_assert(ret < 0 && errno == ENOENT);
+
+  /* ENODEV returned before checking cmd when the device is a Btrfs volume */
+  ret = quotactl(0x12345678, "/dev/dm-0", getuid(), (caddr_t)&dq);
+  test_assert(ret < 0 && (errno == ENOTBLK || errno == ENOENT ||
+                          errno == ENODEV || errno == EINVAL));
+
   find_home_device();
   ret =
       quotactl(QCMD(Q_GETQUOTA, USRQUOTA), home_device, getuid(), (caddr_t)&dq);
@@ -55,6 +69,11 @@ int main(void) {
     atomic_puts("Quotas not enabled on this file system; aborting test");
   } else if (ret < 0 && errno == ENOTBLK) {
     atomic_puts("Home directory device is not a block device; aborting test");
+  } else if (ret < 0 && errno == ENOENT) {
+    /* On Ubuntu 16.06, at least, I'm getting a `/dev/root` which doesn't
+     * actually exist :-(
+     */
+    atomic_puts("Home directory device not found; aborting test");
   } else {
     test_assert(0 == ret);
     atomic_printf("QIF bits=%x\n", dq.dqb_valid);

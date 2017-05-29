@@ -66,6 +66,14 @@ templates = {
         RawBytes(0x89, 0xe5),   # mov %esp,%ebp
         RawBytes(0x0f, 0x34),   # sysenter
     ),
+    'X86SysenterVsyscallImplementationAMD': AssemblyTemplate(
+        RawBytes(0x51),         # push %ecx
+        RawBytes(0x52),         # push %edx
+        RawBytes(0x55),         # push %ebp
+        RawBytes(0x89, 0xcd),   # mov %ecx,%ebp
+        RawBytes(0x0f, 0x05),   # syscall
+        RawBytes(0xcd, 0x80),   # int $0x80
+    ),
     'X86SysenterVsyscallUseInt80': AssemblyTemplate(
         RawBytes(0xcd, 0x80),   # int $0x80
         RawBytes(0xc3),         # ret
@@ -94,23 +102,18 @@ templates = {
         RawBytes(0xc3),         # ret
     ),
     'X86SyscallStubExtendedJump': AssemblyTemplate(
-        RawBytes(0xe9), # jmp
-        Field('relative_jump_target', 4),
-    ),
-    'X86SyscallStubMonkeypatch': AssemblyTemplate(
         # This code must match the stubs in syscall_hook.S.
-        # We must adjust the stack pointer without modifying flags,
-        # at least on the return path.
-        RawBytes(0xc7, 0x84, 0x24, 0x00, 0xf8, 0xff, 0xff), # movq $0,-2048(%esp)
-        RawBytes(0x00, 0x00, 0x00, 0x00),
-        RawBytes(0xc7, 0x84, 0x24, 0x00, 0xff, 0xff, 0xff), # movq $fake_return_addr,-256(%esp)
-        Field('fake_return_addr', 4),
-        RawBytes(0x89, 0xa4, 0x24, 0x04, 0xff, 0xff, 0xff), # mov %esp,-252(%esp)
-        RawBytes(0x8d, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff), # lea -256(%esp),%esp
-        RawBytes(0xe8),         # call $trampoline_relative_addr
-        Field('trampoline_relative_addr', 4),
-        RawBytes(0x8d, 0xa4, 0x24, 0x00, 0x01, 0x00, 0x00), # lea 256(%esp),%esp
-        RawBytes(0xff, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff), # jmp -256(%esp)
+        RawBytes(0x89, 0x25, 0x08, 0x10, 0x00, 0x70), # movl %esp,(stub_scratch_1)
+        RawBytes(0xFF, 0x05, 0x0c, 0x10, 0x00, 0x70), # incl (alt_stack_nesting_level)
+        RawBytes(0x83, 0x3c, 0x25, 0x0c, 0x10, 0x00, 0x70, 0x01), # cmpl 1,(alt_stack_nesting_level)
+        RawBytes(0x75, 0x06),                                     # jne dont_switch
+        RawBytes(0x8b, 0x25, 0x00, 0x10, 0x00, 0x70), # movl (syscallbuf_stub_alt_stack),%esp
+        # dont_switch:
+        RawBytes(0xff, 0x35, 0x08, 0x10, 0x00, 0x70), # pushl (stub_scratch_1)
+        RawBytes(0x68),                               # pushl $return_addr
+        Field('return_addr', 4),
+        RawBytes(0xe9),                               # jmp $trampoline_relative_addr
+        Field('trampoline_relative_addr', 4)
     ),
 
     'X64JumpMonkeypatch': AssemblyTemplate(
@@ -130,25 +133,24 @@ templates = {
         RawBytes(0xc3),         # ret
     ),
     'X64SyscallStubExtendedJump': AssemblyTemplate(
-        RawBytes(0xff, 0x25, 0x00, 0x00, 0x00, 0x00), # jmp *0(%rip)
-        Field('jump_target', 8),
-    ),
-    'X64SyscallStubMonkeypatch': AssemblyTemplate(
         # This code must match the stubs in syscall_hook.S.
-        # We must adjust the stack pointer without modifying flags,
-        # at least on the return path.
-        RawBytes(0xc7, 0x84, 0x24, 0x00, 0xf8, 0xff, 0xff), # movl $0,-2048(%rsp)
-        RawBytes(0x00, 0x00, 0x00, 0x00),
-        RawBytes(0xc7, 0x84, 0x24, 0x00, 0xff, 0xff, 0xff), # movl $return_addr_lo,-256(%rsp)
+        RawBytes(0x48, 0x89, 0x24, 0x25, 0x10, 0x10, 0x00, 0x70), # movq %rsp,(stub_scratch_1)
+        RawBytes(0xFF, 0x04, 0x25, 0x18, 0x10, 0x00, 0x70),       # incl (alt_stack_nesting_level)
+        RawBytes(0x83, 0x3c, 0x25, 0x18, 0x10, 0x00, 0x70, 0x01), # cmpl 1,(alt_stack_nesting_level)
+        RawBytes(0x75, 0x0a),                                     # jne dont_switch
+        RawBytes(0x48, 0x8b, 0x24, 0x25, 0x00, 0x10, 0x00, 0x70), # movq (syscallbuf_stub_alt_stack),%rsp
+        RawBytes(0xeb, 0x07),                                     # jmp after_adjust
+        # dont_switch:
+        RawBytes(0x48, 0x81, 0xec, 0x00, 0x01, 0x00, 0x00), # subq $256, %rsp
+        # after adjust
+        RawBytes(0xff, 0x34, 0x25, 0x10, 0x10, 0x00, 0x70), # pushq (stub_scratch_1)
+        RawBytes(0x50),                                     # pushq rax
+        RawBytes(0xc7, 0x04, 0x24),                         # movl $return_addr_lo,(%rsp)
         Field('return_addr_lo', 4),
-        RawBytes(0xc7, 0x84, 0x24, 0x04, 0xff, 0xff, 0xff), # movl $return_addr_hi,-252(%rsp)
+        RawBytes(0xc7, 0x44, 0x24, 0x04),                   # movl $return_addr_hi,(%rsp+4)
         Field('return_addr_hi', 4),
-        RawBytes(0x48, 0x89, 0xa4, 0x24, 0x08, 0xff, 0xff, 0xff), # mov %rsp,-248(%rsp)
-        RawBytes(0x48, 0x8d, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff), # lea -256(%rsp),%rsp
-        RawBytes(0xe8),         # call $trampoline_relative_addr
-        Field('trampoline_relative_addr', 4),
-        RawBytes(0x48, 0x8d, 0xa4, 0x24, 0x00, 0x01, 0x00, 0x00), # lea 256(%rsp),%rsp
-        RawBytes(0xff, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff), # jmp -256(%rsp)
+        RawBytes(0xff, 0x25, 0x00, 0x00, 0x00, 0x00),       # jmp *0(%rip)
+        Field('jump_target', 8),
     ),
 }
 
@@ -163,7 +165,7 @@ def generate_match_method(byte_array, template):
     args = ', ' + ', '.join("%s* %s" % (t, n) for t, n in zip(field_types, field_names)) \
            if fields else ''
     
-    s.write('static bool match(const uint8_t* buffer %s) {\n' % (args,))
+    s.write('  static bool match(const uint8_t* buffer %s) {\n' % (args,))
     offset = 0
     for chunk in template.chunks:
         if isinstance(chunk, Field):
@@ -186,7 +188,7 @@ def generate_substitute_method(byte_array, template):
     args = ', ' + ', '.join("%s %s" % (t, n) for t, n in zip(field_types, field_names)) \
            if fields else ''
     
-    s.write('static void substitute(uint8_t* buffer %s) {\n' % (args,))
+    s.write('  static void substitute(uint8_t* buffer %s) {\n' % (args,))
     offset = 0
     for chunk in template.chunks:
         if isinstance(chunk, Field):
@@ -200,9 +202,18 @@ def generate_substitute_method(byte_array, template):
     s.write('  }')
     return s.getvalue()
 
+def generate_field_end_methods(byte_array, template):
+    s = StringIO.StringIO()
+    offset = 0
+    for chunk in template.chunks:
+        offset += len(chunk)
+        if isinstance(chunk, Field):
+            s.write('  static const size_t %s_end = %d;\n' % (chunk.name, offset))
+    return s.getvalue()
+
 def generate_size_member(byte_array):
     s = StringIO.StringIO()
-    s.write('static const size_t size = sizeof(%s);' % byte_array)
+    s.write('  static const size_t size = sizeof(%s);' % byte_array)
     return s.getvalue()
 
 def generate(f):
@@ -218,14 +229,16 @@ def generate(f):
         byte_array = byte_array_name(name)
         f.write("""class %(class_name)s {
 public:
-  %(match_method)s
+%(match_method)s
 
-  %(substitute_method)s
+%(substitute_method)s
 
-  %(size_member)s
+%(field_end_methods)s
+%(size_member)s
 };
 """ % { 'class_name': name,
         'match_method': generate_match_method(byte_array, template),
         'substitute_method': generate_substitute_method(byte_array, template),
+        'field_end_methods': generate_field_end_methods(byte_array, template),
         'size_member': generate_size_member(byte_array), })
         f.write('\n\n')

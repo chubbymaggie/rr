@@ -1,7 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "registers"
-
 #include "Registers.h"
 
 #include <array>
@@ -11,11 +9,12 @@
 #include <assert.h>
 #include <string.h>
 
+#include "ReplayTask.h"
 #include "log.h"
-#include "task.h"
 
-using namespace rr;
 using namespace std;
+
+namespace rr {
 
 struct RegisterValue {
   // The name of this register.
@@ -82,7 +81,6 @@ template <> struct RegisterInfo<rr::X86Arch> {
   static const size_t num_registers = DREG_NUM_LINUX_I386;
   typedef RegisterTable<num_registers> Table;
   static Table registers;
-  static RegisterValue non_gdb_registers[0];
 };
 
 template <> struct RegisterInfo<rr::X64Arch> {
@@ -92,7 +90,6 @@ template <> struct RegisterInfo<rr::X64Arch> {
   static const size_t num_registers = DREG_NUM_LINUX_X86_64;
   typedef RegisterTable<num_registers> Table;
   static Table registers;
-  static RegisterValue non_gdb_registers[2];
 };
 
 #define RV_ARCH(gdb_suffix, name, arch, extra_ctor_args)                       \
@@ -143,13 +140,17 @@ RegisterInfo<rr::X86Arch>::Table RegisterInfo<rr::X86Arch>::registers = {
   RV_X86(ESP, esp), RV_X86(EBP, ebp), RV_X86(ESI, esi), RV_X86(EDI, edi),
   RV_X86(EIP, eip), RV_X86_WITH_MASK(EFLAGS, eflags, deterministic_eflags_mask),
   RV_X86_WITH_MASK(CS, xcs, 0), RV_X86_WITH_MASK(SS, xss, 0),
-  RV_X86_WITH_MASK(DS, xds, 0), RV_X86_WITH_MASK(ES, xes, 0), RV_X86(FS, xfs),
-  RV_X86(GS, xgs),
+  RV_X86_WITH_MASK(DS, xds, 0), RV_X86_WITH_MASK(ES, xes, 0),
+  // Mask out the RPL from the fs and gs segment selectors. The kernel
+  // unconditionally sets RPL=3 on sigreturn, but if the segment index is 0,
+  // the RPL doesn't matter, and the CPU resets the entire register to 0,
+  // so whether or not we see this depends on whether the value round-tripped
+  // to the CPU yet.
+  RV_X86_WITH_MASK(FS, xfs, (uint16_t)~3),
+  RV_X86_WITH_MASK(GS, xgs, (uint16_t)~3),
   // The comparison for this is handled specially elsewhere.
   RV_X86_WITH_MASK(ORIG_EAX, orig_eax, 0),
 };
-
-RegisterValue RegisterInfo<rr::X86Arch>::non_gdb_registers[0] = {};
 
 RegisterInfo<rr::X64Arch>::Table RegisterInfo<rr::X64Arch>::registers = {
   RV_X64(RAX, rax), RV_X64(RCX, rcx), RV_X64(RDX, rdx), RV_X64(RBX, rbx),
@@ -163,14 +164,8 @@ RegisterInfo<rr::X64Arch>::Table RegisterInfo<rr::X64Arch>::registers = {
   RV_X64(64_FS, fs), RV_X64(64_GS, gs),
   // The comparison for this is handled specially
   // elsewhere.
-  RV_X64_WITH_MASK(ORIG_RAX, orig_rax, 0),
-};
-
-RegisterValue RegisterInfo<rr::X64Arch>::non_gdb_registers[2] = {
-  { "fs_base", offsetof(rr::X64Arch::user_regs_struct, fs_base), 8,
-    RegisterValue::mask_for_nbytes(8) },
-  { "gs_base", offsetof(rr::X64Arch::user_regs_struct, gs_base), 8,
-    RegisterValue::mask_for_nbytes(8) }
+  RV_X64_WITH_MASK(ORIG_RAX, orig_rax, 0), RV_X64(FS_BASE, fs_base),
+  RV_X64(GS_BASE, gs_base),
 };
 
 #undef RV_X64
@@ -179,7 +174,6 @@ RegisterValue RegisterInfo<rr::X64Arch>::non_gdb_registers[2] = {
 
 // 32-bit format, 64-bit format for all of these.
 // format_index in RegisterPrinting depends on the ordering here.
-static const char* hex_format[] = { "%" PRIx32, "%" PRIx64 };
 static const char* hex_format_leading_0x[] = { "0x%" PRIx32, "0x%" PRIx64 };
 // static const char* decimal_format[] = { "%" PRId32, "%" PRId64 };
 
@@ -234,7 +228,7 @@ void Registers::print_register_file_arch(FILE* f, const char* formats[]) const {
 }
 
 void Registers::print_register_file(FILE* f) const {
-  RR_ARCH_FUNCTION(print_register_file_arch, arch(), f, hex_format);
+  RR_ARCH_FUNCTION(print_register_file_arch, arch(), f, hex_format_leading_0x);
 }
 
 template <typename Arch>
@@ -260,30 +254,9 @@ void Registers::print_register_file_for_trace_arch(
         assert(0 && "bad register size");
     }
   }
-
-  for (auto& rv : RegisterInfo<Arch>::non_gdb_registers) {
-    fprintf(f, " ");
-    const char* name = (style == Annotated ? rv.name : nullptr);
-
-    switch (rv.nbytes) {
-      case 8:
-        print_single_register<8>(f, name, rv.pointer_into(user_regs), formats);
-        break;
-      case 4:
-        print_single_register<4>(f, name, rv.pointer_into(user_regs), formats);
-        break;
-      default:
-        assert(0 && "bad register size");
-    }
-  }
 }
 
 void Registers::print_register_file_compact(FILE* f) const {
-  RR_ARCH_FUNCTION(print_register_file_for_trace_arch, arch(), f, Annotated,
-                   hex_format);
-}
-
-void Registers::print_register_file_for_trace(FILE* f) const {
   RR_ARCH_FUNCTION(print_register_file_for_trace_arch, arch(), f, Annotated,
                    hex_format_leading_0x);
 }
@@ -370,12 +343,12 @@ template <>
     const Registers& reg2, MismatchBehavior mismatch_behavior) {
   bool match = compare_registers_core<rr::X86Arch>(name1, reg1, name2, reg2,
                                                    mismatch_behavior);
-  /* Negative orig_eax values, observed at SCHED events and signals,
-     seemingly can vary between recording and replay on some kernels
-     (e.g. Linux ubuntu 3.13.0-24-generic). They probably reflect
-     signals sent or something like that.
+  /* When the kernel is entered via an interrupt, orig_rax is set to -IRQ.
+     We observe negative orig_eax values at SCHED events and signals and other
+     timer interrupts. These values are only really meaningful to compare when
+     they reflect original syscall numbers, in which case both will be positive.
   */
-  if (reg1.u.x86regs.orig_eax >= 0 || reg2.u.x86regs.orig_eax >= 0) {
+  if (reg1.u.x86regs.orig_eax >= 0 && reg2.u.x86regs.orig_eax >= 0) {
     X86_REGCMP(orig_eax);
   }
   return match;
@@ -387,9 +360,8 @@ template <>
     const Registers& reg2, MismatchBehavior mismatch_behavior) {
   bool match = compare_registers_core<rr::X64Arch>(name1, reg1, name2, reg2,
                                                    mismatch_behavior);
-  // XXX haven't actually observed this to be true on x86-64 yet, but
-  // assuming that it follows the x86 behavior.
-  if ((intptr_t)reg1.u.x64regs.orig_rax >= 0 ||
+  // See comment in the x86 case
+  if ((intptr_t)reg1.u.x64regs.orig_rax >= 0 &&
       (intptr_t)reg2.u.x64regs.orig_rax >= 0) {
     X64_REGCMP(orig_rax);
   }
@@ -414,15 +386,19 @@ template <>
 }
 
 /*static*/ bool Registers::compare_register_files(
-    Task* t, const char* name1, const Registers& reg1, const char* name2,
+    ReplayTask* t, const char* name1, const Registers& reg1, const char* name2,
     const Registers& reg2, MismatchBehavior mismatch_behavior) {
   bool bail_error = mismatch_behavior >= BAIL_ON_MISMATCH;
   bool match = compare_register_files_internal(name1, reg1, name2, reg2,
                                                mismatch_behavior);
 
-  ASSERT(t, !bail_error || match)
-      << "Fatal register mismatch (ticks/rec:" << t->tick_count() << "/"
-      << t->current_trace_frame().ticks() << ")";
+  if (t) {
+    ASSERT(t, !bail_error || match)
+        << "Fatal register mismatch (ticks/rec:" << t->tick_count() << "/"
+        << t->current_trace_frame().ticks() << ")";
+  } else {
+    assert(!bail_error || match);
+  }
 
   if (match && mismatch_behavior == LOG_MISMATCHES) {
     LOG(info) << "(register files are the same for " << name1 << " and "
@@ -435,9 +411,10 @@ template <>
 template <typename Arch>
 size_t Registers::read_register_arch(uint8_t* buf, GdbRegister regno,
                                      bool* defined) const {
-  assert(regno < total_registers());
-  // Make sure these two definitions don't get out of sync.
-  assert(array_length(RegisterInfo<Arch>::registers) == total_registers());
+  if (regno >= array_length(RegisterInfo<Arch>::registers)) {
+    *defined = false;
+    return 0;
+  }
 
   RegisterValue& rv = RegisterInfo<Arch>::registers[regno];
   if (rv.nbytes == 0) {
@@ -477,7 +454,7 @@ size_t Registers::read_register_by_user_offset(uint8_t* buf, uintptr_t offset,
 }
 
 template <typename Arch>
-void Registers::write_register_arch(GdbRegister regno, const uint8_t* value,
+void Registers::write_register_arch(GdbRegister regno, const void* value,
                                     size_t value_size) {
   RegisterValue& rv = RegisterInfo<Arch>::registers[regno];
 
@@ -493,17 +470,27 @@ void Registers::write_register_arch(GdbRegister regno, const uint8_t* value,
   }
 }
 
-void Registers::write_register(GdbRegister regno, const uint8_t* value,
+void Registers::write_register(GdbRegister regno, const void* value,
                                size_t value_size) {
   RR_ARCH_FUNCTION(write_register_arch, arch(), regno, value, value_size);
 }
 
-template <typename Arch> size_t Registers::total_registers_arch() const {
-  return RegisterInfo<Arch>::num_registers;
+template <typename Arch>
+void Registers::write_register_by_user_offset_arch(uintptr_t offset,
+                                                   uintptr_t value) {
+  for (size_t regno = 0; regno < RegisterInfo<Arch>::num_registers; ++regno) {
+    RegisterValue& rv = RegisterInfo<Arch>::registers[regno];
+    if (rv.offset == offset) {
+      assert(rv.nbytes <= sizeof(value));
+      memcpy(rv.pointer_into(&u), &value, rv.nbytes);
+      return;
+    }
+  }
 }
 
-size_t Registers::total_registers() const {
-  RR_ARCH_FUNCTION(total_registers_arch, arch());
+void Registers::write_register_by_user_offset(uintptr_t offset,
+                                              uintptr_t value) {
+  RR_ARCH_FUNCTION(write_register_by_user_offset_arch, arch(), offset, value);
 }
 
 // In theory it doesn't matter how 32-bit register values are sign extended
@@ -591,18 +578,33 @@ vector<uint8_t> Registers::get_ptrace_for_arch(SupportedArch arch) const {
   vector<uint8_t> result;
   switch (arch) {
     case x86:
-      result.resize(sizeof(u.x86regs));
-      memcpy(result.data(), &u.x86regs, result.size());
+      result.resize(sizeof(tmp_regs.u.x86regs));
+      memcpy(result.data(), &tmp_regs.u.x86regs, result.size());
       break;
     case x86_64:
-      result.resize(sizeof(u.x64regs));
-      memcpy(result.data(), &u.x64regs, result.size());
+      result.resize(sizeof(tmp_regs.u.x64regs));
+      memcpy(result.data(), &tmp_regs.u.x64regs, result.size());
       break;
     default:
       assert(0 && "Unknown arch");
       break;
   }
   return result;
+}
+
+void Registers::set_from_ptrace_for_arch(SupportedArch a, const void* data,
+                                         size_t size) {
+  if (a == NativeArch::arch()) {
+    assert(size == sizeof(struct user_regs_struct));
+    set_from_ptrace(*static_cast<const struct user_regs_struct*>(data));
+    return;
+  }
+
+  assert(a == x86 && NativeArch::arch() == x86_64);
+  // We don't support a 32-bit tracee trying to set registers of a 64-bit tracee
+  assert(arch() == x86);
+  assert(size == sizeof(u.x86regs));
+  memcpy(&u.x86regs, data, sizeof(u.x86regs));
 }
 
 uintptr_t Registers::flags() const {
@@ -632,9 +634,28 @@ void Registers::set_flags(uintptr_t value) {
   }
 }
 
+bool Registers::syscall_failed() const {
+  auto result = syscall_result_signed();
+  return -4096 < result && result < 0;
+}
+
+bool Registers::syscall_may_restart() const {
+  switch (-syscall_result_signed()) {
+    case ERESTART_RESTARTBLOCK:
+    case ERESTARTNOINTR:
+    case ERESTARTNOHAND:
+    case ERESTARTSYS:
+      return true;
+    default:
+      return false;
+  }
+}
+
 ostream& operator<<(ostream& stream, const Registers& r) {
   stream << "{ args:(" << HEX(r.arg1()) << "," << HEX(r.arg2()) << ","
          << HEX(r.arg3()) << "," << HEX(r.arg4()) << "," << HEX(r.arg5()) << ","
          << r.arg6() << ") orig_syscall:" << r.original_syscallno() << " }";
   return stream;
 }
+
+} // namespace rr

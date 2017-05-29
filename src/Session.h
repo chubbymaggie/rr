@@ -11,16 +11,21 @@
 #include <vector>
 
 #include "AddressSpace.h"
+#include "MonitoredSharedMemory.h"
 #include "TaskishUid.h"
 #include "TraceStream.h"
+
+namespace rr {
 
 class AddressSpace;
 class DiversionSession;
 class EmuFs;
 class RecordSession;
 class ReplaySession;
+class ReplayTask;
 class Task;
 class TaskGroup;
+class AutoRemoteSyscalls;
 
 // The following types are used by step() APIs in Session subclasses.
 
@@ -30,11 +35,32 @@ class TaskGroup;
 struct BreakStatus {
   BreakStatus()
       : task(nullptr),
-        signal(0),
         breakpoint_hit(false),
         singlestep_complete(false),
         approaching_ticks_target(false),
         task_exit(false) {}
+  BreakStatus(const BreakStatus& other)
+      : task(other.task),
+        watchpoints_hit(other.watchpoints_hit),
+        signal(other.signal
+                   ? std::unique_ptr<siginfo_t>(new siginfo_t(*other.signal))
+                   : nullptr),
+        breakpoint_hit(other.breakpoint_hit),
+        singlestep_complete(other.singlestep_complete),
+        approaching_ticks_target(other.approaching_ticks_target),
+        task_exit(other.task_exit) {}
+  const BreakStatus& operator=(const BreakStatus& other) {
+    task = other.task;
+    watchpoints_hit = other.watchpoints_hit;
+    signal = other.signal
+                 ? std::unique_ptr<siginfo_t>(new siginfo_t(*other.signal))
+                 : nullptr;
+    breakpoint_hit = other.breakpoint_hit;
+    singlestep_complete = other.singlestep_complete;
+    approaching_ticks_target = other.approaching_ticks_target;
+    task_exit = other.task_exit;
+    return *this;
+  }
 
   // The triggering Task. This may be different from session->current_task()
   // when replay switches to a new task when ReplaySession::replay_step() ends.
@@ -42,8 +68,8 @@ struct BreakStatus {
   // List of watchpoints hit; any watchpoint hit causes a stop after the
   // instruction that triggered the watchpoint has completed.
   std::vector<WatchConfig> watchpoints_hit;
-  // When nonzero, we stopped because a signal was delivered to |task|.
-  int signal;
+  // When non-null, we stopped because a signal was delivered to |task|.
+  std::unique_ptr<siginfo_t> signal;
   // True when we stopped because we hit a breakpoint at |task|'s current
   // ip().
   bool breakpoint_hit;
@@ -71,6 +97,10 @@ enum RunCommand {
   RUN_SINGLESTEP_FAST_FORWARD
 };
 
+inline bool is_singlestep(RunCommand command) {
+  return command == RUN_SINGLESTEP || command == RUN_SINGLESTEP_FAST_FORWARD;
+}
+
 /**
  * Sessions track the global state of a set of tracees corresponding
  * to an rr recorder or replayer.  During recording, the tracked
@@ -95,7 +125,7 @@ public:
 
   /**
    * Call |post_exec()| immediately after a tracee has successfully
-   * |execve()|'d.  After that, |can_validate()| returns true.
+   * |execve()|'d.  After that, |done_initial_exec()| returns true.
    * This is called while we're still in the execve syscall so it's not safe
    * to perform remote syscalls in this method.
    *
@@ -107,14 +137,21 @@ public:
    */
   void post_exec();
 
-  bool can_validate() const { return tracees_consistent; }
+  /**
+   * Returns true after the tracee has done the initial exec in Task::spawn.
+   * Before then, tracee state can be inconsistent; from the exec exit-event
+   * onwards, the tracee state much be consistent.
+   */
+  bool done_initial_exec() const { return done_initial_exec_; }
 
   /**
    * Create and return a new address space that's constructed
-   * from |t|'s actual OS address space.
+   * from |t|'s actual OS address space. When spawning, |exe| is the empty
+   * string; it will be replaced during the first execve(), when we first
+   * start running real tracee code.
    */
-  std::shared_ptr<AddressSpace> create_vm(Task* t, const std::string& exe,
-                                          uint32_t exec_count = 0);
+  std::shared_ptr<AddressSpace> create_vm(
+      Task* t, const std::string& exe = std::string(), uint32_t exec_count = 0);
   /**
    * Return a copy of |vm| with the same mappings.  If any
    * mapping is changed, only the |clone()|d copy is updated,
@@ -209,20 +246,63 @@ public:
   }
   Statistics statistics() { return statistics_; }
 
+  virtual Task* new_task(pid_t tid, pid_t rec_tid, uint32_t serial,
+                         SupportedArch a);
+
+  std::string read_spawned_task_error() const;
+
+  static KernelMapping create_shared_mmap(
+      AutoRemoteSyscalls& remote, size_t size, remote_ptr<void> map_hint,
+      const char* name, int tracee_prot = PROT_READ | PROT_WRITE,
+      int tracee_flags = 0,
+      MonitoredSharedMemory::shr_ptr&& monitored = nullptr);
+
+  static bool make_private_shared(AutoRemoteSyscalls& remote,
+                                  const AddressSpace::Mapping m);
+  enum PreserveContents {
+    PRESERVE_CONTENTS,
+    DISCARD_CONTENTS,
+  };
+  static const AddressSpace::Mapping& recreate_shared_mmap(
+      AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
+      PreserveContents preserve = DISCARD_CONTENTS,
+      MonitoredSharedMemory::shr_ptr&& monitored = nullptr);
+
+  /* Takes a mapping and replaces it by one that is shared between rr and
+     the tracee. The caller is responsible for filling the contents of the
+      new mapping. */
+  static const AddressSpace::Mapping& steal_mapping(
+      AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
+      MonitoredSharedMemory::shr_ptr&& monitored = nullptr);
+
+  enum PtraceSyscallBeforeSeccomp {
+    PTRACE_SYSCALL_BEFORE_SECCOMP,
+    SECCOMP_BEFORE_PTRACE_SYSCALL,
+    PTRACE_SYSCALL_BEFORE_SECCOMP_UNKNOWN,
+  };
+  PtraceSyscallBeforeSeccomp syscall_seccomp_ordering() {
+    return syscall_seccomp_ordering_;
+  }
+
+  static const char* rr_mapping_prefix();
+
 protected:
   Session();
   virtual ~Session();
+
+  ScopedFd create_spawn_task_error_pipe();
 
   Session(const Session& other);
   Session& operator=(const Session&) = delete;
 
   virtual void on_create(Task* t);
 
-  BreakStatus diagnose_debugger_trap(Task* t);
+  BreakStatus diagnose_debugger_trap(Task* t, RunCommand run_command);
   void check_for_watchpoint_changes(Task* t, BreakStatus& break_status);
 
-  void copy_state_to(Session& dest, EmuFs& dest_emu_fs);
+  void copy_state_to(Session& dest, EmuFs& emu_fs, EmuFs& dest_emu_fs);
 
+  // XXX Move CloneCompletion/CaptureState etc to ReplayTask/ReplaySession
   struct CloneCompletion;
   // Call this before doing anything that requires access to the full set
   // of tasks (i.e., almost anything!). Not really const!
@@ -240,17 +320,22 @@ protected:
   Statistics statistics_;
 
   uint32_t next_task_serial_;
+  ScopedFd spawned_task_error_fd_;
+
+  PtraceSyscallBeforeSeccomp syscall_seccomp_ordering_;
 
   /**
    * True if we've done an exec so tracees are now in a state that will be
    * consistent across record and replay.
    */
-  bool tracees_consistent;
+  bool done_initial_exec_;
 
   /**
    * True while the execution of this session is visible to users.
    */
   bool visible_execution_;
 };
+
+} // namespace rr
 
 #endif // RR_SESSION_H_

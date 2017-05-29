@@ -1,38 +1,44 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "Session"
-
 #include "Session.h"
 
-#include <syscall.h>
+#include <asm/ptrace.h>
+#include <linux/limits.h>
+#include <linux/unistd.h>
 #include <sys/prctl.h>
+#include <syscall.h>
 
 #include <algorithm>
+#include <limits>
 
 #include "rr/rr.h"
 
 #include "AutoRemoteSyscalls.h"
 #include "EmuFs.h"
+#include "Task.h"
+#include "TaskGroup.h"
 #include "kernel_metadata.h"
 #include "log.h"
-#include "task.h"
 #include "util.h"
 
-using namespace rr;
 using namespace std;
+
+namespace rr {
 
 struct Session::CloneCompletion {
   struct TaskGroup {
     Task* clone_leader;
     Task::CapturedState clone_leader_state;
     vector<Task::CapturedState> member_states;
+    vector<pair<remote_ptr<void>, vector<uint8_t>>> captured_memory;
   };
   vector<TaskGroup> task_groups;
 };
 
 Session::Session()
     : next_task_serial_(1),
-      tracees_consistent(false),
+      syscall_seccomp_ordering_(PTRACE_SYSCALL_BEFORE_SECCOMP_UNKNOWN),
+      done_initial_exec_(false),
       visible_execution_(true) {
   LOG(debug) << "Session " << this << " created";
 }
@@ -49,7 +55,7 @@ Session::~Session() {
 Session::Session(const Session& other) {
   statistics_ = other.statistics_;
   next_task_serial_ = other.next_task_serial_;
-  tracees_consistent = other.tracees_consistent;
+  done_initial_exec_ = other.done_initial_exec_;
   visible_execution_ = other.visible_execution_;
 }
 
@@ -57,13 +63,19 @@ void Session::on_create(TaskGroup* tg) { task_group_map[tg->tguid()] = tg; }
 void Session::on_destroy(TaskGroup* tg) { task_group_map.erase(tg->tguid()); }
 
 void Session::post_exec() {
+  /* We just saw a successful exec(), so from now on we know
+   * that the address space layout for the replay tasks will
+   * (should!) be the same as for the recorded tasks.  So we can
+   * start validating registers at events. */
   assert_fully_initialized();
-  if (tracees_consistent) {
+  if (done_initial_exec_) {
     return;
   }
-  tracees_consistent = true;
+  done_initial_exec_ = true;
   assert(tasks().size() == 1);
-  tasks().begin()->second->flush_inconsistent_state();
+  Task* t = tasks().begin()->second;
+  t->flush_inconsistent_state();
+  spawned_task_error_fd_.close();
 }
 
 AddressSpace::shr_ptr Session::create_vm(Task* t, const std::string& exe,
@@ -113,6 +125,11 @@ TaskGroup::shr_ptr Session::clone(Task* t, TaskGroup::shr_ptr tg) {
       new TaskGroup(this, parent, tg->tgid, t->tid, tg->tguid().serial()));
 }
 
+Task* Session::new_task(pid_t tid, pid_t rec_tid, uint32_t serial,
+                        SupportedArch a) {
+  return new Task(*this, tid, rec_tid, serial, a);
+}
+
 vector<AddressSpace*> Session::vms() const {
   vector<AddressSpace*> result;
   for (auto& vm : vm_map) {
@@ -125,8 +142,8 @@ Task* Session::clone(Task* p, int flags, remote_ptr<void> stack,
                      remote_ptr<void> tls, remote_ptr<int> cleartid_addr,
                      pid_t new_tid, pid_t new_rec_tid) {
   assert_fully_initialized();
-  Task* c = p->clone(flags, stack, tls, cleartid_addr, new_tid, new_rec_tid,
-                     next_task_serial());
+  Task* c = p->clone(Task::TRACEE_CLONE, flags, stack, tls, cleartid_addr,
+                     new_tid, new_rec_tid, next_task_serial());
   on_create(c);
   return c;
 }
@@ -168,56 +185,54 @@ void Session::kill_all_tasks() {
       // During recording we might be aborting the recording, in which case
       // one or more tasks might not be stopped. We haven't got any really
       // good options here so we'll just skip detaching and try killing
-      // it with SIGKILL below. rr will usually exit immediatley after this
+      // it with SIGKILL below. rr will usually exit immediately after this
       // so the likelihood that we'll leak a zombie task isn't too bad.
       continue;
     }
 
-    if (!t->stable_exit) {
-      /*
-       * Prepare to forcibly kill this task by detaching it first. To ensure
-       * the task doesn't continue executing, we first set its ip() to an
-       * invalid value. We need to do this for all tasks in the Session before
-       * kill() is guaranteed to work properly. SIGKILL on ptrace-attached tasks
-       * seems to not work very well, and after sending SIGKILL we can't seem to
-       * reliably detach.
-       */
-      LOG(debug) << "safely detaching from " << t->tid << " ...";
-      // Detaching from the process lets it continue. We don't want a replaying
-      // process to perform syscalls or do anything else observable before we
-      // get around to SIGKILLing it. So we move its ip() to an address
-      // which will cause it to do an exit() syscall if it runs at all.
-      // We used to set this to an invalid address, but that causes a SIGSEGV
-      // to be raised which can cause core dumps after we detach from ptrace.
-      // Making the process undumpable with PR_SET_DUMPABLE turned out not to
-      // be practical because that has a side effect of triggering various
-      // security measures blocking inspection of the process (PTRACE_ATTACH,
-      // access to /proc/<pid>/fd).
-      // Disabling dumps via setrlimit(RLIMIT_CORE, 0) doesn't stop dumps
-      // if /proc/sys/kernel/core_pattern is set to pipe the core to a process
-      // (e.g. to systemd-coredump).
-      // We also tried setting ip() to an address that does an infinite loop,
-      // but that leaves a runaway process if something happens to kill rr
-      // after detaching but before we get a chance to SIGKILL the tracee.
-      Registers r = t->regs();
-      r.set_ip(t->vm()->privileged_traced_syscall_ip());
-      r.set_syscallno(syscall_number_for_exit(r.arch()));
-      r.set_arg1(0);
-      t->set_regs(r);
-      long result;
-      do {
-        // We have observed this failing with an ESRCH when the thread clearly
-        // still exists and is ptraced. Retrying the PTRACE_DETACH seems to
-        // work around it.
-        result = t->fallible_ptrace(PTRACE_DETACH, nullptr, nullptr);
-        ASSERT(t, result >= 0 || errno == ESRCH);
-      } while (result < 0);
-    }
+    /*
+     * Prepare to forcibly kill this task by detaching it first. To ensure
+     * the task doesn't continue executing, we first set its ip() to an
+     * invalid value. We need to do this for all tasks in the Session before
+     * kill() is guaranteed to work properly. SIGKILL on ptrace-attached tasks
+     * seems to not work very well, and after sending SIGKILL we can't seem to
+     * reliably detach.
+     */
+    LOG(debug) << "safely detaching from " << t->tid << " ...";
+    // Detaching from the process lets it continue. We don't want a replaying
+    // process to perform syscalls or do anything else observable before we
+    // get around to SIGKILLing it. So we move its ip() to an address
+    // which will cause it to do an exit() syscall if it runs at all.
+    // We used to set this to an invalid address, but that causes a SIGSEGV
+    // to be raised which can cause core dumps after we detach from ptrace.
+    // Making the process undumpable with PR_SET_DUMPABLE turned out not to
+    // be practical because that has a side effect of triggering various
+    // security measures blocking inspection of the process (PTRACE_ATTACH,
+    // access to /proc/<pid>/fd).
+    // Disabling dumps via setrlimit(RLIMIT_CORE, 0) doesn't stop dumps
+    // if /proc/sys/kernel/core_pattern is set to pipe the core to a process
+    // (e.g. to systemd-coredump).
+    // We also tried setting ip() to an address that does an infinite loop,
+    // but that leaves a runaway process if something happens to kill rr
+    // after detaching but before we get a chance to SIGKILL the tracee.
+    Registers r = t->regs();
+    r.set_ip(t->vm()->privileged_traced_syscall_ip());
+    r.set_syscallno(syscall_number_for_exit(r.arch()));
+    r.set_arg1(0);
+    t->set_regs(r);
+    long result;
+    do {
+      // We have observed this failing with an ESRCH when the thread clearly
+      // still exists and is ptraced. Retrying the PTRACE_DETACH seems to
+      // work around it.
+      result = t->fallible_ptrace(PTRACE_DETACH, nullptr, nullptr);
+      ASSERT(t, result >= 0 || errno == ESRCH);
+    } while (result < 0);
   }
 
   while (!task_map.empty()) {
     Task* t = task_map.rbegin()->second;
-    if (!t->stable_exit && !t->unstable) {
+    if (!t->unstable) {
       /**
        * Destroy the OS task backing this by sending it SIGKILL and
        * ensuring it was delivered.  After |kill()|, the only
@@ -237,7 +252,7 @@ void Session::kill_all_tasks() {
       t->task_group()->destabilize();
     }
 
-    delete t;
+    t->destroy();
   }
 }
 
@@ -254,24 +269,40 @@ void Session::on_destroy(Task* t) {
 
 void Session::on_create(Task* t) { task_map[t->rec_tid] = t; }
 
-BreakStatus Session::diagnose_debugger_trap(Task* t) {
+ScopedFd Session::create_spawn_task_error_pipe() {
+  int fds[2];
+  if (0 != pipe2(fds, O_CLOEXEC)) {
+    FATAL();
+  }
+  spawned_task_error_fd_ = fds[0];
+  return ScopedFd(fds[1]);
+}
+
+string Session::read_spawned_task_error() const {
+  char buf[1024] = "";
+  ssize_t len = read(spawned_task_error_fd_, buf, sizeof(buf));
+  if (len <= 0) {
+    return string();
+  }
+  buf[len] = 0;
+  return string(buf, len);
+}
+
+BreakStatus Session::diagnose_debugger_trap(Task* t, RunCommand run_command) {
   assert_fully_initialized();
   BreakStatus break_status;
   break_status.task = t;
 
-  TrapType pending_bp = t->vm()->get_breakpoint_type_at_addr(t->ip());
-  TrapType retired_bp = t->vm()->get_breakpoint_type_for_retired_insn(t->ip());
+  int stop_sig = t->stop_sig();
+  if (!stop_sig) {
+    // This can happen if we were INCOMPLETE because we're close to
+    // the ticks_target.
+    return break_status;
+  }
 
-  uintptr_t debug_status = t->consume_debug_status();
-
-  // NBB: very little effort has been made to handle
-  // corner cases where multiple
-  // breakpoints/watchpoints/singlesteps are fired
-  // simultaneously.  These cases will be addressed as
-  // they arise in practice.
-  int stop_sig = t->pending_sig();
   if (SIGTRAP != stop_sig) {
-    if (TRAP_BKPT_USER == pending_bp) {
+    BreakpointType pending_bp = t->vm()->get_breakpoint_type_at_addr(t->ip());
+    if (BKPT_USER == pending_bp) {
       // A signal was raised /just/ before a trap
       // instruction for a SW breakpoint.  This is
       // observed when debuggers write trap
@@ -287,38 +318,41 @@ BreakStatus Session::diagnose_debugger_trap(Task* t) {
       // execution, which should raise the original
       // signal again.
       LOG(debug) << "hit debugger breakpoint BEFORE ip " << t->ip() << " for "
-                 << signal_name(stop_sig);
-#ifdef DEBUGTAG
-      siginfo_t si = t->get_siginfo();
-      psiginfo(&si, "  siginfo for signal-stop:\n    ");
-#endif
+                 << t->get_siginfo();
       break_status.breakpoint_hit = true;
     } else if (stop_sig && stop_sig != PerfCounters::TIME_SLICE_SIGNAL) {
-      break_status.signal = stop_sig;
+      break_status.signal =
+          unique_ptr<siginfo_t>(new siginfo_t(t->get_siginfo()));
+      LOG(debug) << "Got signal " << *break_status.signal << " (expected sig "
+                 << stop_sig << ")";
+      break_status.signal->si_signo = stop_sig;
     }
-  } else if (TRAP_BKPT_USER == retired_bp) {
-    LOG(debug) << "hit debugger breakpoint at ip " << t->ip();
-    // SW breakpoint: $ip is just past the
-    // breakpoint instruction.  Move $ip back
-    // right before it.
-    t->move_ip_before_breakpoint();
-    break_status.breakpoint_hit = true;
-  } else if (DS_SINGLESTEP & debug_status) {
-    LOG(debug) << "  finished debugger stepi";
-    break_status.singlestep_complete = true;
+  } else {
+    TrapReasons trap_reasons = t->compute_trap_reasons();
+
+    // Conceal any internal singlestepping
+    if (trap_reasons.singlestep && is_singlestep(run_command)) {
+      LOG(debug) << "  finished debugger stepi";
+      break_status.singlestep_complete = true;
+    }
+
+    if (trap_reasons.watchpoint) {
+      check_for_watchpoint_changes(t, break_status);
+    }
+
+    if (trap_reasons.breakpoint) {
+      BreakpointType retired_bp =
+          t->vm()->get_breakpoint_type_for_retired_insn(t->ip());
+      if (BKPT_USER == retired_bp) {
+        LOG(debug) << "hit debugger breakpoint at ip " << t->ip();
+        // SW breakpoint: $ip is just past the
+        // breakpoint instruction.  Move $ip back
+        // right before it.
+        t->move_ip_before_breakpoint();
+        break_status.breakpoint_hit = true;
+      }
+    }
   }
-  // In VMWare Player 6.0.4 build-2249910, 32-bit Ubuntu x86 guest,
-  // single-stepping does not trigger watchpoints :-(. We work around
-  // that here by calling notify_watchpoint_fired if there's a singlestep
-  // but no watchpoints reported; write-watchpoints will detect that their
-  // value has changed and trigger. Read/exec watchpoints can't be detected
-  // this way so they're still broken :-(.
-  if ((DS_WATCHPOINT_ANY | DS_SINGLESTEP) & debug_status) {
-    LOG(debug) << "  " << t->tid << "(rec:" << t->rec_tid
-               << "): hit debugger watchpoint.";
-    t->vm()->notify_watchpoint_fired(debug_status);
-  }
-  check_for_watchpoint_changes(t, break_status);
 
   return break_status;
 }
@@ -340,6 +374,16 @@ void Session::finish_initializing() const {
   Session* self = const_cast<Session*>(this);
   for (auto& tgleader : clone_completion->task_groups) {
     AutoRemoteSyscalls remote(tgleader.clone_leader);
+    for (auto m : tgleader.clone_leader->vm()->maps()) {
+      // Creating this mapping was delayed in capture_state for performance
+      if (m.flags & AddressSpace::Mapping::IS_SYSCALLBUF) {
+        self->recreate_shared_mmap(remote, m);
+      }
+    }
+    for (auto& mem : tgleader.captured_memory) {
+      tgleader.clone_leader->write_bytes_helper(mem.first, mem.second.size(),
+                                                mem.second.data());
+    }
     for (auto& tgmember : tgleader.member_states) {
       Task* t_clone =
           Task::os_clone_into(tgmember, tgleader.clone_leader, remote);
@@ -352,7 +396,8 @@ void Session::finish_initializing() const {
   self->clone_completion = nullptr;
 }
 
-static void remap_shared_mmap(AutoRemoteSyscalls& remote, EmuFs& dest_emu_fs,
+static void remap_shared_mmap(AutoRemoteSyscalls& remote, EmuFs& emu_fs,
+                              EmuFs& dest_emu_fs,
                               const AddressSpace::Mapping& m_in_mem) {
   AddressSpace::Mapping m = m_in_mem;
 
@@ -361,12 +406,18 @@ static void remap_shared_mmap(AutoRemoteSyscalls& remote, EmuFs& dest_emu_fs,
   remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
                             m.map.start(), m.map.size());
 
-  auto emufile = dest_emu_fs.at(m.recorded_map);
+  EmuFile::shr_ptr emu_file;
+  if (dest_emu_fs.has_file_for(m.recorded_map)) {
+    emu_file = dest_emu_fs.at(m.recorded_map);
+  } else {
+    emu_file = dest_emu_fs.clone_file(emu_fs.at(m.recorded_map));
+  }
+
   // TODO: this duplicates some code in replay_syscall.cc, but
   // it's somewhat nontrivial to factor that code out.
   int remote_fd;
   {
-    string path = emufile->proc_path();
+    string path = emu_file->proc_path();
     AutoRestoreMem child_path(remote, path.c_str());
     // Always open the emufs file O_RDWR, even if the current mapping prot
     // is read-only. We might mprotect it to read-write later.
@@ -392,15 +443,211 @@ static void remap_shared_mmap(AutoRemoteSyscalls& remote, EmuFs& dest_emu_fs,
 
   // We update the AddressSpace mapping too, since that tracks the real file
   // name and we need to update that.
-  remote.task()->vm()->map(m.map.start(), m.map.size(), m.map.prot(),
-                           m.map.flags(), m.map.file_offset_bytes(),
-                           real_file_name, real_file.st_dev, real_file.st_ino,
-                           &m.recorded_map);
+  remote.task()->vm()->map(
+      remote.task(), m.map.start(), m.map.size(), m.map.prot(), m.map.flags(),
+      m.map.file_offset_bytes(), real_file_name, real_file.st_dev,
+      real_file.st_ino, nullptr, &m.recorded_map, emu_file);
 
   remote.infallible_syscall(syscall_number_for_close(remote.arch()), remote_fd);
 }
 
-void Session::copy_state_to(Session& dest, EmuFs& dest_emu_fs) {
+/*static*/ const char* Session::rr_mapping_prefix() { return "/rr-shared-"; }
+
+KernelMapping Session::create_shared_mmap(
+    AutoRemoteSyscalls& remote, size_t size, remote_ptr<void> map_hint,
+    const char* name, int tracee_prot, int tracee_flags,
+    MonitoredSharedMemory::shr_ptr&& monitored) {
+  static int nonce = 0;
+  // Create the segment we'll share with the tracee.
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path) - 1, "%s%s%s-%d-%d", tmp_dir(),
+           rr_mapping_prefix(), name, remote.task()->real_tgid(), nonce++);
+
+  // Let the child create the shmem block and then send the fd back to us.
+  // This lets us avoid having to make the file world-writeable so that
+  // the child can read it when it's in a different user namespace (which
+  // would be a security hole, letting other users abuse rr users).
+  int child_shmem_fd;
+  {
+    AutoRestoreMem child_path(remote, path);
+    // skip leading '/' since we want the path to be relative to the root fd
+    child_shmem_fd = remote.infallible_syscall(
+        syscall_number_for_openat(remote.arch()), RR_RESERVED_ROOT_DIR_FD,
+        child_path.get() + 1, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+  }
+
+  /* Remove the fs name so that we don't have to worry about
+   * cleaning up this segment in error conditions. */
+  unlink(path);
+
+  ScopedFd shmem_fd = remote.retrieve_fd(child_shmem_fd);
+  resize_shmem_segment(shmem_fd, size);
+  LOG(debug) << "created shmem segment " << path;
+
+  // Map the segment in ours and the tracee's address spaces.
+  void* map_addr;
+  int flags = MAP_SHARED;
+  if ((void*)-1 == (map_addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                                    flags, shmem_fd, 0))) {
+    FATAL() << "Failed to mmap shmem region";
+  }
+  if (!map_hint.is_null()) {
+    flags |= MAP_FIXED;
+  }
+  remote_ptr<void> child_map_addr = remote.infallible_mmap_syscall(
+      map_hint, size, tracee_prot, flags, child_shmem_fd, 0);
+
+  struct stat st;
+  ASSERT(remote.task(), 0 == ::fstat(shmem_fd, &st));
+  KernelMapping km = remote.task()->vm()->map(
+      remote.task(), child_map_addr, size, tracee_prot, flags | tracee_flags, 0,
+      path, st.st_dev, st.st_ino, nullptr, nullptr, nullptr, map_addr,
+      std::move(monitored));
+
+  shmem_fd.close();
+  remote.infallible_syscall(syscall_number_for_close(remote.arch()),
+                            child_shmem_fd);
+  return km;
+}
+
+static char* extract_name(char* name_buffer, size_t buffer_size) {
+  // Recover the name that was originally chosen by finding the part of the
+  // name between rr_mapping_prefix and the -%d-%d at the end.
+  char* path_start = strstr(name_buffer, Session::rr_mapping_prefix());
+  assert(path_start && "Passed something to create_shared_mmap that"
+                       " wasn't a mapping shared between rr and the tracee?");
+  size_t prefix_len = path_start - name_buffer;
+  buffer_size -= prefix_len;
+  name_buffer += prefix_len;
+
+  char* name_end = name_buffer + strnlen(name_buffer, buffer_size);
+  char* name_start = name_buffer + strlen(Session::rr_mapping_prefix());
+  int hyphens_seen = 0;
+  while (name_end > name_start) {
+    --name_end;
+    if (*name_end == '-') {
+      ++hyphens_seen;
+    } else if (*name_end == '/') {
+      assert(false && "Passed something to create_shared_mmap that"
+                      " wasn't a mapping shared between rr and the tracee?");
+    }
+    if (hyphens_seen == 2) {
+      break;
+    }
+  }
+  assert(hyphens_seen == 2);
+  *name_end = '\0';
+  return name_start;
+}
+
+// Recreate an mmap region that is shared between rr and the tracee. The caller
+// is responsible for recreating the data in the new mmap, if `preserve` is
+// DISCARD_CONTENTS.
+const AddressSpace::Mapping& Session::recreate_shared_mmap(
+    AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
+    PreserveContents preserve, MonitoredSharedMemory::shr_ptr&& monitored) {
+  char name[PATH_MAX];
+  strncpy(name, m.map.fsname().c_str(), sizeof(name));
+  uint32_t flags = m.flags;
+  size_t size = m.map.size();
+  void* preserved_data = preserve == PRESERVE_CONTENTS ? m.local_addr : nullptr;
+  if (preserved_data) {
+    remote.task()->vm()->detach_local_mapping(m.map.start());
+  }
+  remote_ptr<void> new_addr =
+      create_shared_mmap(remote, m.map.size(), m.map.start(),
+                         extract_name(name, sizeof(name)), m.map.prot(), 0,
+                         std::move(monitored))
+          .start();
+  // m may be invalid now
+  remote.task()->vm()->mapping_flags_of(new_addr) = flags;
+  auto& new_map = remote.task()->vm()->mapping_of(new_addr);
+  if (preserved_data) {
+    memcpy(new_map.local_addr, preserved_data, size);
+    munmap(preserved_data, size);
+  }
+  return new_map;
+}
+
+const AddressSpace::Mapping& Session::steal_mapping(
+    AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
+    MonitoredSharedMemory::shr_ptr&& monitored) {
+  // We will include the name of the full path of the original mapping in the
+  // name of the shared mapping, replacing slashes by dashes.
+  char name[PATH_MAX - 40];
+  strncpy(name, m.map.fsname().c_str(), sizeof(name));
+  name[sizeof(name) - 1] = '\0';
+  for (char* ptr = name; *ptr != '\0'; ++ptr) {
+    if (*ptr == '/') {
+      *ptr = '-';
+    }
+  }
+
+  // Now create the new mapping in its place
+  remote_ptr<void> start = m.map.start();
+  size_t sz = m.map.size();
+  const AddressSpace::Mapping& new_m = remote.task()->vm()->mapping_of(
+      create_shared_mmap(remote, sz, start, name, m.map.prot(),
+                         m.map.flags() & (MAP_GROWSDOWN | MAP_STACK),
+                         std::move(monitored))
+          .start());
+  return new_m;
+}
+
+// Replace a MAP_PRIVATE segment by one that is shared between rr and the
+// tracee. Returns true on success
+bool Session::make_private_shared(AutoRemoteSyscalls& remote,
+                                  const AddressSpace::Mapping m) {
+  if (!(m.map.flags() & MAP_PRIVATE)) {
+    return false;
+  }
+  // Find a place to map the current segment to temporarily
+  remote_ptr<void> start = m.map.start();
+  size_t sz = m.map.size();
+  remote_ptr<void> free_mem = remote.task()->vm()->find_free_memory(sz);
+  remote.infallible_syscall(syscall_number_for_mremap(remote.arch()), start, sz,
+                            sz, MREMAP_MAYMOVE | MREMAP_FIXED, free_mem);
+  remote.task()->vm()->remap(remote.task(), start, sz, free_mem, sz);
+
+  // AutoRemoteSyscalls may have gotten unlucky and picked the old stack
+  // segment as it's scratch space, reevaluate that choice
+  AutoRemoteSyscalls remote2(remote.task());
+
+  const AddressSpace::Mapping& new_m = steal_mapping(remote2, m);
+
+  // And copy over the contents. Since we can't just call memcpy in the
+  // inferior, just copy directly from the remote private into the local
+  // reference of the shared mapping. We use the fallible read method to
+  // handle the case where the mapping is larger than the backing file, which
+  // would otherwise cause a short read.
+  remote2.task()->read_bytes_fallible(free_mem, sz, new_m.local_addr);
+
+  // Finally unmap the original segment
+  remote2.infallible_syscall(syscall_number_for_munmap(remote.arch()), free_mem,
+                             sz);
+  remote.task()->vm()->unmap(remote.task(), free_mem, sz);
+  return true;
+}
+
+static vector<uint8_t> capture_syscallbuf(const AddressSpace::Mapping& m,
+                                          Task* clone_leader) {
+  remote_ptr<uint8_t> start = m.map.start().cast<uint8_t>();
+  auto syscallbuf_hdr = start.cast<struct syscallbuf_hdr>();
+  size_t data_size;
+  if (clone_leader->read_mem(REMOTE_PTR_FIELD(syscallbuf_hdr, locked))) {
+    // There may be an incomplete syscall record after num_rec_bytes that
+    // we need to capture here. We don't know how big that record is,
+    // so just record the entire buffer. This should not be common.
+    data_size = m.map.size();
+  } else {
+    data_size = clone_leader->read_mem(
+                    REMOTE_PTR_FIELD(syscallbuf_hdr, num_rec_bytes)) +
+                sizeof(struct syscallbuf_hdr);
+  }
+  return clone_leader->read_mem(start, data_size);
+}
+
+void Session::copy_state_to(Session& dest, EmuFs& emu_fs, EmuFs& dest_emu_fs) {
   assert_fully_initialized();
   assert(!dest.clone_completion);
 
@@ -423,9 +670,19 @@ void Session::copy_state_to(Session& dest, EmuFs& dest_emu_fs) {
     {
       AutoRemoteSyscalls remote(group.clone_leader);
       for (auto m : group.clone_leader->vm()->maps()) {
-        if ((m.recorded_map.flags() & MAP_SHARED) &&
-            dest_emu_fs.has_file_for(m.recorded_map)) {
-          remap_shared_mmap(remote, dest_emu_fs, m);
+        // Special case the syscallbuf as a performance optimization. The amount
+        // of data we need to capture is usually significantly smaller than the
+        // size of the mapping, so allocating the whole mapping here would be
+        // wasteful.
+        if (m.flags & AddressSpace::Mapping::IS_SYSCALLBUF) {
+          group.captured_memory.push_back(make_pair(
+              m.map.start(), capture_syscallbuf(m, group.clone_leader)));
+        } else if (m.local_addr != nullptr) {
+          ASSERT(group.clone_leader,
+                 m.map.start() == AddressSpace::preload_thread_locals_start());
+        } else if ((m.recorded_map.flags() & MAP_SHARED) &&
+                   emu_fs.has_file_for(m.recorded_map)) {
+          remap_shared_mmap(remote, emu_fs, dest_emu_fs, m);
         }
       }
 
@@ -445,3 +702,5 @@ void Session::copy_state_to(Session& dest, EmuFs& dest_emu_fs) {
 
   assert(dest.vms().size() > 0);
 }
+
+} // namespace rr

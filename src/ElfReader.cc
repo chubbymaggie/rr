@@ -1,0 +1,275 @@
+/* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
+
+#include "ElfReader.h"
+
+#include <elf.h>
+
+#include "log.h"
+
+using namespace std;
+
+namespace rr {
+
+class ElfReaderImplBase {
+public:
+  ElfReaderImplBase(ElfReader& r) : r(r), ok_(false) {}
+  virtual ~ElfReaderImplBase() {}
+  virtual SymbolTable read_symbols(const char* symtab, const char* strtab) = 0;
+  virtual DynamicSection read_dynamic() = 0;
+  bool ok() { return ok_; }
+
+protected:
+  ElfReader& r;
+  bool ok_;
+};
+
+template <typename Arch> class ElfReaderImpl : public ElfReaderImplBase {
+public:
+  ElfReaderImpl(ElfReader& r);
+  virtual SymbolTable read_symbols(const char* symtab,
+                                   const char* strtab) override;
+  virtual DynamicSection read_dynamic() override;
+
+private:
+  const typename Arch::ElfShdr* find_section(const char* n);
+
+  typename Arch::ElfEhdr elfheader;
+  vector<typename Arch::ElfShdr> sections;
+  vector<char> section_names;
+};
+
+template <typename Arch>
+unique_ptr<ElfReaderImplBase> elf_reader_impl_arch(ElfReader& r) {
+  return unique_ptr<ElfReaderImplBase>(new ElfReaderImpl<Arch>(r));
+}
+
+unique_ptr<ElfReaderImplBase> elf_reader_impl(ElfReader& r,
+                                              SupportedArch arch) {
+  RR_ARCH_FUNCTION(elf_reader_impl_arch, arch, r);
+}
+
+template <typename Arch>
+ElfReaderImpl<Arch>::ElfReaderImpl(ElfReader& r) : ElfReaderImplBase(r) {
+  if (!r.read(0, elfheader) || memcmp(&elfheader, ELFMAG, SELFMAG) != 0 ||
+      elfheader.e_ident[EI_CLASS] != Arch::elfclass ||
+      elfheader.e_ident[EI_DATA] != Arch::elfendian ||
+      elfheader.e_machine != Arch::elfmachine ||
+      elfheader.e_shentsize != sizeof(typename Arch::ElfShdr) ||
+      elfheader.e_shstrndx >= elfheader.e_shnum) {
+    LOG(debug) << "Invalid ELF file: invalid header";
+    return;
+  }
+
+  sections =
+      r.read<typename Arch::ElfShdr>(elfheader.e_shoff, elfheader.e_shnum);
+  if (sections.empty()) {
+    LOG(debug) << "Invalid ELF file: no sections";
+    return;
+  }
+
+  auto& section_names_section = sections[elfheader.e_shstrndx];
+  section_names = r.read<char>(section_names_section.sh_offset,
+                               section_names_section.sh_size);
+  if (section_names.empty()) {
+    LOG(debug) << "Invalid ELF file: can't read section names";
+    return;
+  }
+  section_names[section_names.size() - 1] = 0;
+
+  ok_ = true;
+}
+
+template <typename Arch>
+const typename Arch::ElfShdr* ElfReaderImpl<Arch>::find_section(const char* n) {
+  typename Arch::ElfShdr* section = nullptr;
+
+  for (size_t i = 0; i < elfheader.e_shnum; ++i) {
+    auto& s = sections[i];
+    if (s.sh_name >= section_names.size()) {
+      LOG(debug) << "Invalid ELF file: invalid name offset for section " << i;
+      continue;
+    }
+    const char* name = section_names.data() + s.sh_name;
+    if (strcmp(name, n) == 0) {
+      if (section) {
+        LOG(debug) << "Invalid ELF file: duplicate symbol section " << n;
+        return nullptr;
+      }
+      section = &s;
+    }
+  }
+
+  if (!section) {
+    LOG(debug) << "Missing section " << n;
+  }
+  return section;
+}
+
+template <typename Arch>
+SymbolTable ElfReaderImpl<Arch>::read_symbols(const char* symtab,
+                                              const char* strtab) {
+  SymbolTable result;
+  if (!ok()) {
+    return result;
+  }
+
+  const typename Arch::ElfShdr* symbols = find_section(symtab);
+  if (!symbols) {
+    return result;
+  }
+  const typename Arch::ElfShdr* strings = find_section(strtab);
+  if (!strtab) {
+    return result;
+  }
+
+  if (symbols->sh_entsize != sizeof(typename Arch::ElfSym)) {
+    LOG(debug) << "Invalid ELF file: incorrect symbol size "
+               << symbols->sh_entsize;
+    return result;
+  }
+  if (symbols->sh_size % symbols->sh_entsize) {
+    LOG(debug) << "Invalid ELF file: incorrect symbol section size "
+               << symbols->sh_size;
+    return result;
+  }
+  if (strings->sh_size == 0) {
+    LOG(debug) << "Invalid ELF file: empty string table";
+    return result;
+  }
+
+  auto symbol_list = r.read<typename Arch::ElfSym>(
+      symbols->sh_offset, symbols->sh_size / symbols->sh_entsize);
+  if (symbol_list.empty()) {
+    LOG(debug) << "Invalid ELF file: can't read symbols " << symtab;
+    return result;
+  }
+  result.strtab = r.read<char>(strings->sh_offset, strings->sh_size);
+  if (result.strtab.empty()) {
+    LOG(debug) << "Invalid ELF file: can't read strings " << strtab;
+  }
+  result.strtab[result.strtab.size() - 1] = 0;
+  result.symbols.resize(symbol_list.size());
+  for (size_t i = 0; i < symbol_list.size(); ++i) {
+    auto& s = symbol_list[i];
+    if (s.st_shndx >= sections.size()) {
+      // Don't leave this entry uninitialized
+      result.symbols[i] = SymbolTable::Symbol(0, 0);
+      continue;
+    }
+    auto& section = sections[s.st_shndx];
+    result.symbols[i] = SymbolTable::Symbol(
+        s.st_value - section.sh_addr + section.sh_offset, s.st_name);
+  }
+  return result;
+}
+
+template <typename Arch> DynamicSection ElfReaderImpl<Arch>::read_dynamic() {
+  DynamicSection result;
+  if (!ok()) {
+    return result;
+  }
+
+  const typename Arch::ElfShdr* dynamic = find_section(".dynamic");
+  if (!dynamic) {
+    return result;
+  }
+  const typename Arch::ElfShdr* dynstr = find_section(".dynstr");
+  if (!dynstr) {
+    return result;
+  }
+
+  if (dynamic->sh_entsize != sizeof(typename Arch::ElfDyn)) {
+    LOG(debug) << "Invalid ELF file: incorrect .dynamic size "
+               << dynamic->sh_entsize;
+    return result;
+  }
+  if (!dynamic->sh_size) {
+    return result;
+  }
+  if (dynamic->sh_size % dynamic->sh_entsize) {
+    LOG(debug) << "Invalid ELF file: incorrect .dynamic section size "
+               << dynamic->sh_size;
+    return result;
+  }
+  if (dynstr->sh_size == 0) {
+    LOG(debug) << "Invalid ELF file: empty string table";
+    return result;
+  }
+
+  auto dyn_list = r.read<typename Arch::ElfDyn>(
+      dynamic->sh_offset, dynamic->sh_size / dynamic->sh_entsize);
+  if (dyn_list.empty()) {
+    LOG(debug) << "Invalid ELF file: can't read .dynamic";
+    return result;
+  }
+  result.strtab = r.read<char>(dynstr->sh_offset, dynstr->sh_size);
+  if (result.strtab.empty()) {
+    LOG(debug) << "Invalid ELF file: can't read .dynstr";
+  }
+  result.strtab[result.strtab.size() - 1] = 0;
+  result.entries.resize(dyn_list.size());
+  for (size_t i = 0; i < dyn_list.size(); ++i) {
+    auto& s = dyn_list[i];
+    result.entries[i] = DynamicSection::Entry(s.d_tag, s.d_val);
+  }
+  return result;
+}
+
+ElfReader::ElfReader(SupportedArch arch) : arch(arch) {}
+
+ElfReader::~ElfReader() {}
+
+ElfReaderImplBase& ElfReader::impl() {
+  if (!impl_) {
+    impl_ = elf_reader_impl(*this, arch);
+  }
+  return *impl_;
+}
+
+SymbolTable ElfReader::read_symbols(const char* symtab, const char* strtab) {
+  return impl().read_symbols(symtab, strtab);
+}
+
+DynamicSection ElfReader::read_dynamic() { return impl().read_dynamic(); }
+
+bool ElfReader::ok() { return impl().ok(); }
+
+static bool read_all(ScopedFd& fd, size_t offset, size_t size, void* buf) {
+  while (size) {
+    ssize_t ret = pread(fd.get(), buf, size, offset);
+    if (ret <= 0) {
+      return false;
+    }
+    offset += ret;
+    size -= ret;
+    buf = static_cast<uint8_t*>(buf) + ret;
+  }
+  return true;
+}
+
+bool ElfFileReader::read(size_t offset, size_t size, void* buf) {
+  return read_all(fd, offset, size, buf);
+}
+
+SupportedArch ElfFileReader::identify_arch(ScopedFd& fd) {
+  /**
+   * This code is quite lax. That's OK because this is only used to create
+   * a specific ElfReaderImpl, which does much more thorough checking of the
+   * header.
+   */
+  static const int header_prefix_size = 20;
+  char buf[header_prefix_size];
+  if (!read_all(fd, 0, sizeof(buf), buf) || buf[5] != 1) {
+    return NativeArch::arch();
+  }
+  switch (buf[18] | (buf[19] << 8)) {
+    case 0x03:
+      return x86;
+    case 0x3e:
+      return x86_64;
+    default:
+      return NativeArch::arch();
+  }
+}
+
+} // namespace rr

@@ -1,24 +1,83 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "GdbCommand"
-
 #include "GdbCommand.h"
+
+#include "ReplayTask.h"
+#include "log.h"
 
 using namespace std;
 
+namespace rr {
+
 static SimpleGdbCommand when("when", [](GdbServer&, Task* t,
                                         const vector<string>&) {
-  return string("Current event: ") + to_string(t->current_trace_frame().time());
+  if (!t->session().is_replaying()) {
+    return GdbCommandHandler::cmd_end_diversion();
+  }
+  return string("Current event: ") +
+         to_string(static_cast<ReplayTask*>(t)->current_trace_frame().time());
 });
 
 static SimpleGdbCommand when_ticks("when-ticks", [](GdbServer&, Task* t,
                                                     const vector<string>&) {
+  if (!t->session().is_replaying()) {
+    return GdbCommandHandler::cmd_end_diversion();
+  }
   return string("Current tick: ") + to_string(t->tick_count());
 });
 
 static SimpleGdbCommand when_tid("when-tid", [](GdbServer&, Task* t,
                                                 const vector<string>&) {
+  if (!t->session().is_replaying()) {
+    return GdbCommandHandler::cmd_end_diversion();
+  }
   return string("Current tid: ") + to_string(t->tid);
+});
+
+static std::vector<ReplayTimeline::Mark> back_stack;
+static ReplayTimeline::Mark current_history_cp;
+static std::vector<ReplayTimeline::Mark> forward_stack;
+static SimpleGdbCommand rr_history_push(
+    "rr-history-push",
+    [](GdbServer& gdb_server, Task* t, const vector<string>&) {
+      if (!t->session().is_replaying()) {
+        // Don't create new history state inside a diversion
+        return string();
+      }
+      if (current_history_cp) {
+        back_stack.push_back(current_history_cp);
+      }
+      current_history_cp = gdb_server.get_timeline().mark();
+      forward_stack.clear();
+      return string();
+    });
+static SimpleGdbCommand back("back", [](GdbServer& gdb_server, Task* t,
+                                        const vector<string>&) {
+  if (!t->session().is_replaying()) {
+    return GdbCommandHandler::cmd_end_diversion();
+  }
+  if (back_stack.size() == 0) {
+    return string("Can't go back. No more history entries.");
+  }
+  forward_stack.push_back(current_history_cp);
+  current_history_cp = back_stack.back();
+  back_stack.pop_back();
+  gdb_server.get_timeline().seek_to_mark(current_history_cp);
+  return string();
+});
+static SimpleGdbCommand forward("forward", [](GdbServer& gdb_server, Task* t,
+                                              const vector<string>&) {
+  if (!t->session().is_replaying()) {
+    return GdbCommandHandler::cmd_end_diversion();
+  }
+  if (forward_stack.size() == 0) {
+    return string("Can't go forward. No more history entries.");
+  }
+  back_stack.push_back(current_history_cp);
+  current_history_cp = forward_stack.back();
+  forward_stack.pop_back();
+  gdb_server.get_timeline().seek_to_mark(current_history_cp);
+  return string();
 });
 
 static int gNextCheckpointId = 0;
@@ -27,15 +86,15 @@ string invoke_checkpoint(GdbServer& gdb_server, Task*,
                          const vector<string>& args) {
   const string& where = args[1];
   int checkpoint_id = ++gNextCheckpointId;
+  GdbServer::Checkpoint::Explicit e;
   if (gdb_server.timeline.can_add_checkpoint()) {
-    gdb_server.checkpoints[checkpoint_id] = GdbServer::Checkpoint(
-        gdb_server.timeline, gdb_server.last_continue_tuid,
-        GdbServer::Checkpoint::EXPLICIT, where);
-    return string("Checkpoint ") + to_string(checkpoint_id) + " at " + where;
+    e = GdbServer::Checkpoint::EXPLICIT;
   } else {
-    // TODO Use non-explicit mark checkpoints.
-    return "Error: Checkpoints are not supported here.";
+    e = GdbServer::Checkpoint::NOT_EXPLICIT;
   }
+  gdb_server.checkpoints[checkpoint_id] = GdbServer::Checkpoint(
+      gdb_server.timeline, gdb_server.last_continue_tuid, e, where);
+  return string("Checkpoint ") + to_string(checkpoint_id) + " at " + where;
 }
 static SimpleGdbCommand checkpoint("checkpoint", invoke_checkpoint);
 
@@ -44,7 +103,9 @@ string invoke_delete_checkpoint(GdbServer& gdb_server, Task*,
   int id = stoi(args[1]);
   auto it = gdb_server.checkpoints.find(id);
   if (it != gdb_server.checkpoints.end()) {
-    gdb_server.timeline.remove_explicit_checkpoint(it->second.mark);
+    if (it->second.is_explicit == GdbServer::Checkpoint::EXPLICIT) {
+      gdb_server.timeline.remove_explicit_checkpoint(it->second.mark);
+    }
     gdb_server.checkpoints.erase(it);
     return string("Deleted checkpoint ") + to_string(id) + ".";
   } else {
@@ -72,3 +133,5 @@ static SimpleGdbCommand info_checkpoints("info checkpoints",
 /*static*/ void GdbCommand::init_auto_args() {
   checkpoint.add_auto_arg("rr-where");
 }
+
+} // namespace rr

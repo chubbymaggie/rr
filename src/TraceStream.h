@@ -13,11 +13,15 @@
 #include "CompressedReader.h"
 #include "CompressedWriter.h"
 #include "Event.h"
-#include "remote_ptr.h"
+#include "TaskishUid.h"
 #include "TraceFrame.h"
 #include "TraceTaskEvent.h"
+#include "remote_ptr.h"
+
+namespace rr {
 
 class KernelMapping;
+class Task;
 
 /**
  * TraceStream stores all the data common to both recording and
@@ -48,16 +52,14 @@ public:
     MMAPS,
     // Substream that stores task creation and exec events
     TASKS,
+    // Substream that stores arbitrary per-event records
+    GENERIC,
     SUBSTREAM_COUNT
   };
 
   /** Return the directory storing this trace's files. */
   const string& dir() const { return trace_dir; }
 
-  const string& initial_exe() const { return argv[0]; }
-  const std::vector<string>& initial_argv() const { return argv; }
-  const std::vector<string>& initial_envp() const { return envp; }
-  const string& initial_cwd() const { return cwd; }
   int bound_to_cpu() const { return bind_to_cpu; }
 
   /**
@@ -66,20 +68,16 @@ public:
    */
   TraceFrame::Time time() const { return global_time; }
 
+  std::string file_data_clone_file_name(const TaskUid& tuid);
+
 protected:
-  TraceStream(const string& trace_dir, TraceFrame::Time initial_time)
-      : trace_dir(trace_dir), global_time(initial_time) {}
+  TraceStream(const string& trace_dir, TraceFrame::Time initial_time);
 
   /**
    * Return the path of the file for the given substream.
    */
   string path(Substream s);
 
-  /**
-   * Return the path of the "args_env" file, into which the
-   * initial tracee argv and envp are recorded.
-   */
-  string args_env_path() const { return trace_dir + "/args_env"; }
   /**
    * Return the path of "version" file, into which the current
    * trace format version of rr is stored upon creation of the
@@ -94,13 +92,8 @@ protected:
 
   // Directory into which we're saving the trace files.
   string trace_dir;
-  // The initial argv and envp for a tracee.
-  std::vector<string> argv;
-  std::vector<string> envp;
-  // Current working directory at start of record/replay.
-  string cwd;
   // CPU core# that the tracees are bound to
-  int bind_to_cpu;
+  int32_t bind_to_cpu;
 
   // Arbitrary notion of trace time, ticked on the recording of
   // each event (trace frame).
@@ -109,6 +102,8 @@ protected:
 
 class TraceWriter : public TraceStream {
 public:
+  bool supports_file_data_cloning() { return supports_file_data_cloning_; }
+
   /**
    * Write trace frame to the trace.
    *
@@ -118,13 +113,20 @@ public:
   void write_frame(const TraceFrame& frame);
 
   enum RecordInTrace { DONT_RECORD_IN_TRACE, RECORD_IN_TRACE };
-  enum MappingOrigin { SYSCALL_MAPPING, EXEC_MAPPING, PATCH_MAPPING };
+  enum MappingOrigin {
+    SYSCALL_MAPPING,
+    // Just memory moved from one place to another, so no recording needed.
+    REMAP_MAPPING,
+    EXEC_MAPPING,
+    PATCH_MAPPING,
+    RR_BUFFER_MAPPING
+  };
   /**
    * Write mapped-region record to the trace.
    * If this returns RECORD_IN_TRACE, then the data for the map should be
    * recorded in the trace raw-data.
    */
-  RecordInTrace write_mapped_region(const KernelMapping& map,
+  RecordInTrace write_mapped_region(Task* t, const KernelMapping& map,
                                     const struct stat& stat,
                                     MappingOrigin origin = SYSCALL_MAPPING);
 
@@ -133,12 +135,18 @@ public:
    * 'addr' is the address in the tracee where the data came from/will be
    * restored to.
    */
-  void write_raw(const void* data, size_t len, remote_ptr<void> addr);
+  void write_raw(pid_t tid, const void* data, size_t len,
+                 remote_ptr<void> addr);
 
   /**
    * Write a task event (clone or exec record) to the trace.
    */
   void write_task_event(const TraceTaskEvent& event);
+
+  /**
+   * Write a generic data record to the trace.
+   */
+  void write_generic(const void* data, size_t len);
 
   /**
    * Return true iff all trace files are "good".
@@ -153,18 +161,21 @@ public:
   void close();
 
   /**
-   * Create a trace that will record the initial exe
-   * image |argv[0]| with initial args |argv|, initial environment |envp|,
-   * current working directory |cwd| and bound to cpu |bind_to_cpu|. This
-   * data is recored in the trace.
-   * The trace name is determined by the global rr args and environment.
+   * Create a trace where the tracess are bound to cpu |bind_to_cpu|. This
+   * data is recorded in the trace.
+   * The trace name is determined by |file_name| and _RR_TRACE_DIR (if set).
    */
-  TraceWriter(const std::vector<std::string>& argv,
-              const std::vector<std::string>& envp, const string& cwd,
-              int bind_to_cpu);
+  TraceWriter(const std::string& file_name, int bind_to_cpu);
+
+  /**
+   * We got far enough into recording that we should set this as the latest
+   * trace.
+   */
+  void make_latest_trace();
 
 private:
   std::string try_hardlink_file(const std::string& file_name);
+  bool try_clone_file(const std::string& file_name, std::string* new_name);
 
   CompressedWriter& writer(Substream s) { return *writers[s]; }
   const CompressedWriter& writer(Substream s) const { return *writers[s]; }
@@ -174,8 +185,9 @@ private:
    * Files that have already been mapped without being copied to the trace,
    * i.e. that we have already assumed to be immutable.
    */
-  std::set<std::pair<dev_t, ino_t> > files_assumed_immutable;
+  std::set<std::pair<dev_t, ino_t>> files_assumed_immutable;
   uint32_t mmap_count;
+  bool supports_file_data_cloning_;
 };
 
 class TraceReader : public TraceStream {
@@ -187,6 +199,7 @@ public:
   struct RawData {
     std::vector<uint8_t> data;
     remote_ptr<void> addr;
+    pid_t rec_tid;
   };
 
   /**
@@ -198,6 +211,10 @@ public:
    */
   TraceFrame read_frame();
 
+  /**
+   * For REMAP_MAPPING maps, the memory contents are preserved so we don't
+   * need a source. We use SOURCE_ZERO for that case and it's ignored.
+   */
   enum MappedDataSource { SOURCE_TRACE, SOURCE_FILE, SOURCE_ZERO };
   /**
    * Where to obtain data for the mapped region.
@@ -206,24 +223,23 @@ public:
     MappedDataSource source;
     /** Name of file to map the data from. */
     string file_name;
-    /** Data offset within the file. */
-    uint64_t file_data_offset_bytes;
+    /** Data offset within |file_name|. */
+    uint64_t data_offset_bytes;
     /** Original size of mapped file. */
     uint64_t file_size_bytes;
   };
   /**
    * Read the next mapped region descriptor and return it.
-   * Also returns where to get the mapped data in 'data'.
-   * If |found| is non-null, set *found to indicate whether a descriptor
+   * Also returns where to get the mapped data in |*data|, if it's non-null.
+   * If |found| is non-null, set |*found| to indicate whether a descriptor
    * was found for the current event.
    */
-  KernelMapping read_mapped_region(MappedData* data, bool* found = nullptr);
-
-  /**
-   * Peek at the next mapping. Returns an empty region if there isn't one for
-   * the current event.
-   */
-  KernelMapping peek_mapped_region();
+  enum ValidateSourceFile { VALIDATE, DONT_VALIDATE };
+  enum TimeConstraint { CURRENT_TIME_ONLY, ANY_TIME };
+  KernelMapping read_mapped_region(
+      MappedData* data = nullptr, bool* found = nullptr,
+      ValidateSourceFile validate = VALIDATE,
+      TimeConstraint time_constraint = CURRENT_TIME_ONLY);
 
   /**
    * Read a task event (clone or exec record) from the trace.
@@ -243,6 +259,10 @@ public:
    */
   bool read_raw_data_for_frame(const TraceFrame& frame, RawData& d);
 
+  void read_generic(std::vector<uint8_t>& out);
+  bool read_generic_for_frame(const TraceFrame& frame,
+                              std::vector<uint8_t>& out);
+
   /**
    * Return true iff all trace files are "good".
    * for more details.
@@ -259,13 +279,6 @@ public:
    * state.
    */
   TraceFrame peek_frame();
-
-  /**
-   * Peek ahead in the stream to find the next trace frame that
-   * matches the requested parameters. Returns the frame if one
-   * was found, and issues a fatal error if not.
-   */
-  TraceFrame peek_to(pid_t pid, EventType type, SyscallState state);
 
   /**
    * Restore the state of this to what it was just after
@@ -295,5 +308,7 @@ private:
 
   std::unique_ptr<CompressedReader> readers[SUBSTREAM_COUNT];
 };
+
+} // namespace rr
 
 #endif /* RR_TRACE_H_ */

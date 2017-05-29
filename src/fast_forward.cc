@@ -1,13 +1,12 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "FastForward"
-
 #include "fast_forward.h"
 
 #include "log.h"
 
-using namespace rr;
 using namespace std;
+
+namespace rr {
 
 struct InstructionBuf {
   SupportedArch arch;
@@ -115,6 +114,11 @@ static void bound_iterations_for_watchpoint(Task* t, remote_ptr<void> reg,
                                             const DecodedInstruction& decoded,
                                             const WatchConfig& watch,
                                             uintptr_t* iterations) {
+  if (watch.num_bytes == 0) {
+    // Ignore zero-sized watch. It can't ever trigger.
+    return;
+  }
+
   // Compute how many iterations it will take before we hit the watchpoint.
   // 0 means the first iteration will hit the watchpoint.
   int size = decoded.operand_size;
@@ -157,7 +161,7 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
   remote_code_ptr ip = t->ip();
 
   t->resume_execution(how, RESUME_WAIT, RESUME_UNLIMITED_TICKS);
-  if (t->pending_sig() != SIGTRAP) {
+  if (t->stop_sig() != SIGTRAP) {
     // we might have stepped into a system call...
     return false;
   }
@@ -165,7 +169,7 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
   if (t->ip() != ip) {
     return false;
   }
-  if (t->vm()->get_breakpoint_type_at_addr(ip) != TRAP_NONE) {
+  if (t->vm()->get_breakpoint_type_at_addr(ip) != BKPT_NONE) {
     // breakpoint must have fired
     return false;
   }
@@ -216,6 +220,8 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
 
     uintptr_t cur_cx = t->regs().cx();
     if (cur_cx == 0) {
+      // Fake singlestep status for trap diagnosis
+      t->set_debug_status(DS_SINGLESTEP);
       // This instruction will be skipped entirely.
       return did_execute;
     }
@@ -273,6 +279,8 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
     }
 
     if (iterations == 0) {
+      // Fake singlestep status for trap diagnosis
+      t->set_debug_status(DS_SINGLESTEP);
       return did_execute;
     }
 
@@ -297,20 +305,33 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
       LOG(debug) << "Set x86-string fast-forward watchpoint at " << watch_di;
       bool ok = t->vm()->add_watchpoint(watch_di, 1, WATCH_READWRITE);
       ASSERT(t, ok) << "Can't even handle one watchpoint???";
-      ok = t->vm()->add_breakpoint(limit_ip, TRAP_BKPT_INTERNAL);
+      ok = t->vm()->add_breakpoint(limit_ip, BKPT_INTERNAL);
       ASSERT(t, ok) << "Failed to add breakpoint";
 
       t->resume_execution(RESUME_CONT, RESUME_WAIT, RESUME_UNLIMITED_TICKS);
       did_execute = true;
-      ASSERT(t, t->pending_sig() == SIGTRAP);
+      ASSERT(t, t->stop_sig() == SIGTRAP);
       // Grab debug_status before restoring watchpoints, since the latter
       // clears the debug status
       bool triggered_watchpoint =
-          t->vm()->notify_watchpoint_fired(t->consume_debug_status());
-      t->vm()->remove_breakpoint(limit_ip, TRAP_BKPT_INTERNAL);
+          t->vm()->notify_watchpoint_fired(t->debug_status());
+      t->vm()->remove_breakpoint(limit_ip, BKPT_INTERNAL);
       t->vm()->restore_watchpoints();
 
-      iterations -= cur_cx - t->regs().cx();
+      ASSERT(t, cur_cx > t->regs().cx());
+      uintptr_t iterations_performed = cur_cx - t->regs().cx();
+      // we shoudn't execute more iterations than we asked for.
+      // In Ubuntu-14 4.2.0-27-generic in a KVM guest we have seen watchpoints
+      // failing to fire during string_instructions_replay. We plow through
+      // and hit the backup breakpoint. triggered_watchpoint is true because
+      // the memory has changed. This assertion should catch such errors.
+      ASSERT(t, iterations >= iterations_performed);
+      iterations -= iterations_performed;
+      // instructions that don't modify flags should not terminate too early.
+      // We can terminate prematurely when the watchpoint we set relative
+      // to DI is triggered by a read via SI.
+      ASSERT(t, decoded.modifies_flags || iterations <= BYTES_COALESCED ||
+                    triggered_watchpoint);
 
       if (!triggered_watchpoint) {
         // watchpoint didn't fire. We must have exited the loop early and
@@ -323,13 +344,15 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
         tmp.set_ip(limit_ip);
         t->set_regs(tmp);
       } else {
+        ASSERT(t, t->ip() == limit_ip || t->ip() == ip);
         watch_offset = decoded.operand_size * (iterations - 1);
         if (watch_offset > BYTES_COALESCED) {
+          // Fake singlestep status for trap diagnosis
+          t->set_debug_status(DS_SINGLESTEP);
           // We fired the watchpoint too early, perhaps because reads through SI
           // triggered it. Let's just bail out now; better for the caller to
-          // retry
-          // fast_forward_through_instruction than for us to try singlestepping
-          // all the rest of the way.
+          // retry fast_forward_through_instruction than for us to try
+          // singlestepping all the rest of the way.
           LOG(debug) << "x86-string fast-forward: " << iterations
                      << " iterations to go, but watchpoint hit early; aborted";
           return did_execute;
@@ -342,11 +365,12 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
 
     // Singlestep through the remaining iterations.
     while (iterations > 0 && t->ip() == ip) {
-      t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT,
-                          RESUME_UNLIMITED_TICKS);
+      // Don't count ticks here. Reactivating the performance counter can be
+      // expensive and since we know we're just executing the string instruction
+      // we shouldn't miss any ticks here.
+      t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT, RESUME_NO_TICKS);
       did_execute = true;
-      ASSERT(t, t->pending_sig() == SIGTRAP);
-      t->consume_debug_status();
+      ASSERT(t, t->stop_sig() == SIGTRAP);
       // Watchpoints can fire spuriously because configure_watch_registers
       // can increase the size of the watched area to conserve watch registers.
       --iterations;
@@ -368,7 +392,7 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
     } else {
       LOG(debug) << "x86-string fast-forward done; ip()==" << t->ip();
       // Fake singlestep status for trap diagnosis
-      t->replace_debug_status(DS_SINGLESTEP);
+      t->set_debug_status(DS_SINGLESTEP);
       return did_execute;
     }
   }
@@ -423,7 +447,7 @@ static int fallible_read_byte(Task* t, remote_ptr<uint8_t> ip) {
   return byte;
 }
 
-static bool is_string_instruction_at(Task* t, remote_code_ptr ip) {
+bool is_string_instruction_at(Task* t, remote_code_ptr ip) {
   bool found_rep = false;
   remote_ptr<uint8_t> bare_ip = ip.to_data_ptr<uint8_t>();
   while (true) {
@@ -469,3 +493,13 @@ bool maybe_at_or_after_x86_string_instruction(Task* t) {
   return is_string_instruction_at(t, t->ip()) ||
          is_string_instruction_before(t, t->ip());
 }
+
+bool at_x86_string_instruction(Task* t) {
+  if (!is_x86ish(t)) {
+    return false;
+  }
+
+  return is_string_instruction_at(t, t->ip());
+}
+
+} // namespace rr

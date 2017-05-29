@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <iostream>
 
+namespace rr {
+
 /**
  * Number of bytes to use as the element size when doing pointer arithmetic
  * on this type. We specialize 'void' to use 1 byte to make a lot of our
@@ -25,7 +27,7 @@ public:
   remote_ptr(uintptr_t ptr) : ptr(ptr) {}
   remote_ptr(std::nullptr_t) : ptr(0) {}
   template <typename U> remote_ptr(remote_ptr<U> p) : ptr(p.as_int()) {
-    consume_dummy(static_cast<U*>(nullptr));
+    consume_dummy(static_cast<typename std::remove_cv<U>::type*>(nullptr));
   }
 
   uintptr_t as_int() const { return ptr; }
@@ -70,6 +72,7 @@ public:
     return remote_ptr<U>(ptr);
   }
 
+  explicit operator bool() const { return ptr != 0; }
   bool operator!() const { return !ptr; }
   bool operator<(const remote_ptr<T>& other) const { return ptr < other.ptr; }
   bool operator<=(const remote_ptr<T>& other) const { return ptr <= other.ptr; }
@@ -80,10 +83,13 @@ public:
 
   bool is_null() const { return !ptr; }
 
-  template <typename U> remote_ptr<U> field(U& dummy) {
-    return remote_ptr<U>(ptr + reinterpret_cast<uintptr_t>(&dummy));
+  template <typename U>
+  remote_ptr<typename std::remove_cv<U>::type> field(U*,
+                                                     uintptr_t offset) const {
+    return remote_ptr<typename std::remove_cv<U>::type>(ptr + offset);
   }
   T* dummy() { return nullptr; }
+  const T* dummy() const { return nullptr; }
 
   size_t referent_size() { return sizeof(T); }
 
@@ -98,12 +104,19 @@ private:
  * returns a remote_ptr pointing to field f of the struct pointed to by
  * remote_ptr p
  */
-#define REMOTE_PTR_FIELD(p, f) (p).field((p).dummy()->f)
+#define REMOTE_PTR_FIELD(p, f)                                                 \
+  ((p).field(                                                                  \
+      ((typename std::remove_reference<decltype(                               \
+            (p).dummy()->f)>::type*)nullptr),                                  \
+      offsetof(typename std::remove_reference<decltype(*(p).dummy())>::type,   \
+               f)))
 
 template <typename T>
 std::ostream& operator<<(std::ostream& stream, remote_ptr<T> p) {
   stream << (void*)p.as_int();
   return stream;
 }
+
+} // namespace rr
 
 #endif /* RR_REMOTE_PTR_H_ */

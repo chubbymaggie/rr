@@ -6,27 +6,39 @@
 #include <err.h>
 #include <fcntl.h>
 #include <linux/perf_event.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <string>
 
+#include "Flags.h"
 #include "kernel_metadata.h"
 #include "log.h"
 #include "util.h"
 
 using namespace std;
 
+namespace rr {
+
 static bool attributes_initialized;
 static struct perf_event_attr ticks_attr;
+static struct perf_event_attr cycles_attr;
 static struct perf_event_attr page_faults_attr;
 static struct perf_event_attr hw_interrupts_attr;
 static struct perf_event_attr instructions_retired_attr;
+static uint32_t skid_size;
+static bool has_ioc_period_bug;
+static bool has_kvm_in_txcp_bug;
+static bool supports_txcp;
+static bool only_one_counter;
+static bool activate_useless_counter;
 
 /*
  * Find out the cpu model using the cpuid instruction.
@@ -44,7 +56,10 @@ enum CpuMicroarch {
   IntelIvyBridge,
   IntelHaswell,
   IntelBroadwell,
-  IntelSkylake
+  IntelSkylake,
+  IntelSilvermont,
+  IntelKabylake,
+  AMDRyzen,
 };
 
 struct PmuConfig {
@@ -53,21 +68,43 @@ struct PmuConfig {
   unsigned rcb_cntr_event;
   unsigned rinsn_cntr_event;
   unsigned hw_intr_cntr_event;
+  uint32_t skid_size;
   bool supported;
+  /*
+   * Some CPUs turn off the whole PMU when there are no remaining events
+   * scheduled (perhaps as a power consumption optimization). This can be a
+   * very expensive operation, and is thus best avoided. For cpus, where this
+   * is a problem, we keep a cycles counter (which corresponds to one of the
+   * fixed function counters, so we don't use up a programmable PMC) that we
+   * don't otherwise use, but keeps the PMU active, greatly increasing
+   * performance.
+   */
+  bool benefits_from_useless_counter;
 };
 
 // XXX please only edit this if you really know what you're doing.
 static const PmuConfig pmu_configs[] = {
-  { IntelSkylake, "Intel Skylake", 0x5101c4, 0x5100c0, 0x5301cb, true },
-  { IntelBroadwell, "Intel Broadwell", 0x5101c4, 0x5100c0, 0x5301cb, true },
-  { IntelHaswell, "Intel Haswell", 0x5101c4, 0x5100c0, 0x5301cb, true },
-  { IntelIvyBridge, "Intel Ivy Bridge", 0x5101c4, 0x5100c0, 0x5301cb, true },
-  { IntelSandyBridge, "Intel Sandy Bridge", 0x5101c4, 0x5100c0, 0x5301cb,
-    true },
-  { IntelNehalem, "Intel Nehalem", 0x5101c4, 0x5100c0, 0x50011d, true },
-  { IntelWestmere, "Intel Westmere", 0x5101c4, 0x5100c0, 0x50011d, true },
-  { IntelPenryn, "Intel Penryn", 0, 0, 0, false },
-  { IntelMerom, "Intel Merom", 0, 0, 0, false },
+  { IntelKabylake, "Intel Kabylake", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
+    false },
+  { IntelSilvermont, "Intel Silvermont", 0x517ec4, 0x5100c0, 0x5301cb, 100,
+    true, true },
+  { IntelSkylake, "Intel Skylake", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
+    false },
+  { IntelBroadwell, "Intel Broadwell", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
+    false },
+  { IntelHaswell, "Intel Haswell", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
+    false },
+  { IntelIvyBridge, "Intel Ivy Bridge", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
+    false },
+  { IntelSandyBridge, "Intel Sandy Bridge", 0x5101c4, 0x5100c0, 0x5301cb, 100,
+    true, false },
+  { IntelNehalem, "Intel Nehalem", 0x5101c4, 0x5100c0, 0x50011d, 100, true,
+    false },
+  { IntelWestmere, "Intel Westmere", 0x5101c4, 0x5100c0, 0x50011d, 100, true,
+    false },
+  { IntelPenryn, "Intel Penryn", 0, 0, 0, 100, false, false },
+  { IntelMerom, "Intel Merom", 0, 0, 0, 100, false, false },
+  { AMDRyzen, "AMD Ryzen", 0x5100d1, 0x5100c0, 0, 1000, true, false },
 };
 
 static string lowercase(const string& s) {
@@ -94,9 +131,9 @@ static CpuMicroarch get_cpu_microarch() {
     FATAL() << "Forced uarch " << Flags::get().forced_uarch << " isn't known.";
   }
 
-  unsigned int cpu_type, eax, ecx, edx;
-  cpuid(CPUID_GETFEATURES, 0, &eax, &ecx, &edx);
-  cpu_type = (eax & 0xF0FF0);
+  auto cpuid_data = cpuid(CPUID_GETFEATURES, 0);
+  unsigned int cpu_type = (cpuid_data.eax & 0xF0FF0);
+  unsigned int ext_family = (cpuid_data.eax >> 20) & 0xff;
   switch (cpu_type) {
     case 0x006F0:
     case 0x10660:
@@ -127,12 +164,31 @@ static CpuMicroarch get_cpu_microarch() {
     case 0x406F0:
     case 0x50660:
       return IntelBroadwell;
+    case 0x406e0:
     case 0x506e0:
       return IntelSkylake;
+    case 0x50670:
+      return IntelSilvermont;
+    case 0x806e0:
+    case 0x906e0:
+      return IntelKabylake;
+    case 0x00f10:
+      if (ext_family == 8) {
+        if (!Flags::get().suppress_environment_warnings) {
+          fprintf(stderr, "You have a Ryzen CPU. The Ryzen "
+                          "retired-conditional-branches hardware\n"
+                          "performance counter is not accurate enough; rr will "
+                          "be unreliable.\n"
+                          "See https://github.com/mozilla/rr/issues/2034.\n");
+        }
+        return AMDRyzen;
+      }
+      break;
     default:
-      FATAL() << "CPU " << HEX(cpu_type) << " unknown.";
-      return UnknownCpu; // not reached
+      break;
   }
+  FATAL() << "CPU " << HEX(cpu_type) << " unknown.";
+  return UnknownCpu; // not reached
 }
 
 static void init_perf_event_attr(struct perf_event_attr* attr,
@@ -145,6 +201,167 @@ static void init_perf_event_attr(struct perf_event_attr* attr,
   // only.
   attr->exclude_kernel = 1;
   attr->exclude_guest = 1;
+}
+
+static const uint64_t IN_TX = 1ULL << 32;
+static const uint64_t IN_TXCP = 1ULL << 33;
+
+static int64_t read_counter(ScopedFd& fd) {
+  int64_t val;
+  ssize_t nread = read(fd, &val, sizeof(val));
+  assert(nread == sizeof(val));
+  return val;
+}
+
+static ScopedFd start_counter(pid_t tid, int group_fd,
+                              struct perf_event_attr* attr,
+                              bool* disabled_txcp = nullptr) {
+  if (disabled_txcp) {
+    *disabled_txcp = false;
+  }
+  int fd = syscall(__NR_perf_event_open, attr, tid, -1, group_fd, 0);
+  if (0 > fd && errno == EINVAL && attr->type == PERF_TYPE_RAW &&
+      (attr->config & IN_TXCP)) {
+    // The kernel might not support IN_TXCP, so try again without it.
+    struct perf_event_attr tmp_attr = *attr;
+    tmp_attr.config &= ~IN_TXCP;
+    fd = syscall(__NR_perf_event_open, &tmp_attr, tid, -1, group_fd, 0);
+    if (fd >= 0) {
+      if (disabled_txcp) {
+        *disabled_txcp = true;
+      }
+      LOG(warn) << "kernel does not support IN_TXCP";
+      if ((cpuid(CPUID_GETEXTENDEDFEATURES, 0).ebx & HLE_FEATURE_FLAG) &&
+          !Flags::get().suppress_environment_warnings) {
+        fprintf(stderr,
+                "Your CPU supports Hardware Lock Elision but your kernel does\n"
+                "not support setting the IN_TXCP PMU flag. Record and replay\n"
+                "of code that uses HLE will fail unless you update your\n"
+                "kernel.\n");
+      }
+    }
+  }
+  if (0 > fd) {
+    if (errno == EACCES) {
+      FATAL() << "Permission denied to use 'perf_event_open'; are perf events "
+                 "enabled? Try 'perf record'.";
+    }
+    if (errno == ENOENT) {
+      FATAL() << "Unable to open performance counter with 'perf_event_open'; "
+                 "are perf events enabled? Try 'perf record'.";
+    }
+    FATAL() << "Failed to initialize counter";
+  }
+  return fd;
+}
+
+static void check_for_ioc_period_bug() {
+  // Start a cycles counter
+  struct perf_event_attr attr = rr::ticks_attr;
+  attr.sample_period = 0xffffffff;
+  attr.exclude_kernel = 1;
+  ScopedFd bug_fd = start_counter(0, -1, &attr);
+
+  uint64_t new_period = 1;
+  if (ioctl(bug_fd, PERF_EVENT_IOC_PERIOD, &new_period)) {
+    FATAL() << "ioctl(PERF_EVENT_IOC_PERIOD) failed";
+  }
+
+  struct pollfd poll_bug_fd = {.fd = bug_fd, .events = POLL_IN, .revents = 0 };
+  poll(&poll_bug_fd, 1, 0);
+
+  has_ioc_period_bug = poll_bug_fd.revents == 0;
+  LOG(debug) << "has_ioc_period_bug=" << has_ioc_period_bug;
+}
+
+static const int NUM_BRANCHES = 500;
+
+static void do_branches() {
+  // Do NUM_BRANCHES conditional branches that can't be optimized out.
+  // 'accumulator' is always odd and can't be zero
+  int accumulator = rand() * 2 + 1;
+  for (int i = 0; i < 500 && accumulator; ++i) {
+    accumulator = ((accumulator * 7) + 2) & 0xffffff;
+  }
+  srand(accumulator);
+}
+
+static void check_for_kvm_in_txcp_bug() {
+  int64_t count = 0;
+  struct perf_event_attr attr = rr::ticks_attr;
+  attr.config |= IN_TXCP;
+  attr.sample_period = 0;
+  bool disabled_txcp;
+  ScopedFd fd = start_counter(0, -1, &attr, &disabled_txcp);
+  if (fd.is_open() && !disabled_txcp) {
+    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+    do_branches();
+    count = read_counter(fd);
+  }
+
+  supports_txcp = count > 0;
+  has_kvm_in_txcp_bug = supports_txcp && count < NUM_BRANCHES;
+  LOG(debug) << "supports txcp=" << supports_txcp;
+  LOG(debug) << "has_kvm_in_txcp_bug=" << has_kvm_in_txcp_bug
+             << " count=" << count;
+}
+
+static void check_working_counters() {
+  struct perf_event_attr attr = rr::ticks_attr;
+  attr.sample_period = 0;
+  struct perf_event_attr attr2 = rr::cycles_attr;
+  attr.sample_period = 0;
+  ScopedFd fd = start_counter(0, -1, &attr);
+  ScopedFd fd2 = start_counter(0, -1, &attr2);
+  do_branches();
+  int64_t events = read_counter(fd);
+  int64_t events2 = read_counter(fd2);
+
+  if (events < NUM_BRANCHES) {
+    char config[100];
+    sprintf(config, "%llx", (long long)ticks_attr.config);
+    FATAL()
+        << "\nGot " << events << " branch events, expected at least "
+        << NUM_BRANCHES
+        << ".\n"
+           "\nThe hardware performance counter seems to not be working. Check\n"
+           "that hardware performance counters are working by running\n"
+           "  perf stat -e r"
+        << config
+        << " true\n"
+           "and checking that it reports a nonzero number of events.\n"
+           "If performance counters seem to be working with 'perf', file an\n"
+           "rr issue, otherwise check your hardware/OS/VM configuration. Also\n"
+           "check that other software is not using performance counters on\n"
+           "this CPU.";
+  }
+
+  only_one_counter = events2 == 0;
+  LOG(debug) << "only_one_counter=" << only_one_counter;
+
+  if (only_one_counter &&
+      (cpuid(CPUID_GETEXTENDEDFEATURES, 0).ebx & HLE_FEATURE_FLAG) &&
+      !Flags::get().suppress_environment_warnings) {
+    fprintf(stderr,
+            "Your CPU supports Hardware Lock Elision but you only have one\n"
+            "hardware performance counter available. Record and replay\n"
+            "of code that uses HLE will fail unless you alter your\n"
+            "configuration to make more than one hardware performance counter\n"
+            "available.\n");
+  }
+}
+
+static void check_for_bugs() {
+  if (running_under_rr()) {
+    // Under rr we emulate idealized performance counters, so we can assume
+    // none of the bugs apply.
+    return;
+  }
+
+  check_for_ioc_period_bug();
+  check_for_kvm_in_txcp_bug();
+  check_working_counters();
 }
 
 static void init_attributes() {
@@ -167,7 +384,10 @@ static void init_attributes() {
     FATAL() << "Microarchitecture `" << pmu->name << "' currently unsupported.";
   }
 
+  skid_size = pmu->skid_size;
   init_perf_event_attr(&ticks_attr, PERF_TYPE_RAW, pmu->rcb_cntr_event);
+  init_perf_event_attr(&cycles_attr, PERF_TYPE_HARDWARE,
+                       PERF_COUNT_HW_CPU_CYCLES);
   init_perf_event_attr(&instructions_retired_attr, PERF_TYPE_RAW,
                        pmu->rinsn_cntr_event);
   init_perf_event_attr(&hw_interrupts_attr, PERF_TYPE_RAW,
@@ -177,62 +397,155 @@ static void init_attributes() {
   hw_interrupts_attr.exclude_hv = 1;
   init_perf_event_attr(&page_faults_attr, PERF_TYPE_SOFTWARE,
                        PERF_COUNT_SW_PAGE_FAULTS);
+
+  check_for_bugs();
+  /*
+   * For maintainability, and since it doesn't impact performance when not
+   * needed, we always activate this. If it ever turns out to be a problem,
+   * this can be set to pmu->benefits_from_useless_counter, instead.
+   *
+   * We also disable this counter when running under rr. Even though it's the
+   * same event for the same task as the outer rr, the linux kernel does not
+   * coalesce them and tries to schedule the new one on a general purpose PMC.
+   * On CPUs with only 2 general PMCs (e.g. KNL), we'd run out.
+   */
+  activate_useless_counter = has_ioc_period_bug && !running_under_rr();
 }
 
-PerfCounters::PerfCounters(pid_t tid) : tid(tid), started(false) {
+bool PerfCounters::is_ticks_attr(const perf_event_attr& attr) {
+  init_attributes();
+  perf_event_attr tmp_attr = attr;
+  tmp_attr.sample_period = 0;
+  tmp_attr.config &= ~IN_TXCP;
+  return memcmp(&ticks_attr, &tmp_attr, sizeof(attr)) == 0;
+}
+
+uint32_t PerfCounters::skid_size() {
+  init_attributes();
+  return rr::skid_size;
+}
+
+PerfCounters::PerfCounters(pid_t tid)
+    : counting(false), tid(tid), started(false) {
   init_attributes();
 }
 
-static ScopedFd start_counter(pid_t tid, int group_fd,
-                              struct perf_event_attr* attr) {
-  int fd = syscall(__NR_perf_event_open, attr, tid, -1, group_fd, 0);
-  if (0 > fd) {
-    if (errno == EACCES) {
-      FATAL() << "Permission denied to use 'perf_event_open'; are perf events "
-                 "enabled? Try 'perf record'.";
-    }
-    if (errno == ENOENT) {
-      FATAL() << "Unable to open performance counter with 'perf_event_open'; "
-                 "are perf events enabled? Try 'perf record'.";
-    }
-    FATAL() << "Failed to initialize counter";
+static void make_counter_async(ScopedFd& fd, int signal) {
+  if (fcntl(fd, F_SETFL, O_ASYNC) || fcntl(fd, F_SETSIG, signal)) {
+    FATAL() << "Failed to make ticks counter ASYNC with sig"
+            << signal_name(signal);
   }
-  if (ioctl(fd, PERF_EVENT_IOC_ENABLE, 0)) {
-    FATAL() << "Failed to start counter";
-  }
-  return fd;
+}
+
+static bool always_recreate_counters() {
+  // When we have the KVM IN_TXCP bug, reenabling the TXCP counter after
+  // disabling it does not work.
+  return has_ioc_period_bug || has_kvm_in_txcp_bug;
 }
 
 void PerfCounters::reset(Ticks ticks_period) {
   assert(ticks_period >= 0);
 
-  stop();
-
-  struct perf_event_attr attr = ticks_attr;
-  attr.sample_period = ticks_period;
-  fd_ticks = start_counter(tid, -1, &attr);
-
-  struct f_owner_ex own;
-  own.type = F_OWNER_TID;
-  own.pid = tid;
-  if (fcntl(fd_ticks, F_SETOWN_EX, &own)) {
-    FATAL() << "Failed to SETOWN_EX ticks event fd";
-  }
-  if (fcntl(fd_ticks, F_SETFL, O_ASYNC) ||
-      fcntl(fd_ticks, F_SETSIG, PerfCounters::TIME_SLICE_SIGNAL)) {
-    FATAL() << "Failed to make ticks counter ASYNC with sig"
-            << signal_name(PerfCounters::TIME_SLICE_SIGNAL);
+  if (ticks_period == 0 && !always_recreate_counters()) {
+    // We can't switch a counter between sampling and non-sampling via
+    // PERF_EVENT_IOC_PERIOD so just turn 0 into a very big number.
+    ticks_period = uint64_t(1) << 60;
   }
 
-  if (extra_perf_counters_enabled()) {
-    int group_leader = fd_ticks;
-    fd_hw_interrupts = start_counter(tid, group_leader, &hw_interrupts_attr);
-    fd_instructions_retired =
-        start_counter(tid, group_leader, &instructions_retired_attr);
-    fd_page_faults = start_counter(tid, group_leader, &page_faults_attr);
+  if (!started) {
+    LOG(debug) << "Recreating counters with period " << ticks_period;
+
+    struct perf_event_attr attr = rr::ticks_attr;
+    attr.sample_period = ticks_period;
+    fd_ticks_interrupt = start_counter(tid, -1, &attr);
+
+    if (!only_one_counter && supports_txcp) {
+      if (has_kvm_in_txcp_bug) {
+        // IN_TXCP isn't going to work reliably. Assume that HLE/RTM are not
+        // used,
+        // and check that.
+        attr.sample_period = 0;
+        attr.config |= IN_TX;
+        fd_ticks_in_transaction = start_counter(tid, fd_ticks_interrupt, &attr);
+      } else {
+        // Set up a separate counter for measuring ticks, which does not have
+        // a sample period and does not count events during aborted
+        // transactions.
+        // We have to use two separate counters here because the kernel does
+        // not support setting a sample_period with IN_TXCP, apparently for
+        // reasons related to this Intel note on IA32_PERFEVTSEL2:
+        // ``When IN_TXCP=1 & IN_TX=1 and in sampling, spurious PMI may
+        // occur and transactions may continuously abort near overflow
+        // conditions. Software should favor using IN_TXCP for counting over
+        // sampling. If sampling, software should use large “sample-after“
+        // value after clearing the counter configured to use IN_TXCP and
+        // also always reset the counter even when no overflow condition
+        // was reported.''
+        attr.sample_period = 0;
+        attr.config |= IN_TXCP;
+        fd_ticks_measure = start_counter(tid, fd_ticks_interrupt, &attr);
+      }
+    }
+
+    if (activate_useless_counter && !fd_useless_counter.is_open()) {
+      // N.B.: This is deliberately not in the same group as the other counters
+      // since we want to keep it scheduled at all times.
+      fd_useless_counter = start_counter(tid, -1, &cycles_attr);
+    }
+
+    struct f_owner_ex own;
+    own.type = F_OWNER_TID;
+    own.pid = tid;
+    if (fcntl(fd_ticks_interrupt, F_SETOWN_EX, &own)) {
+      FATAL() << "Failed to SETOWN_EX ticks event fd";
+    }
+    make_counter_async(fd_ticks_interrupt, PerfCounters::TIME_SLICE_SIGNAL);
+
+    if (extra_perf_counters_enabled()) {
+      int group_leader = fd_ticks_interrupt;
+      fd_hw_interrupts = start_counter(tid, group_leader, &hw_interrupts_attr);
+      fd_instructions_retired =
+          start_counter(tid, group_leader, &instructions_retired_attr);
+      fd_page_faults = start_counter(tid, group_leader, &page_faults_attr);
+    }
+  } else {
+    LOG(debug) << "Resetting counters with period " << ticks_period;
+
+    if (ioctl(fd_ticks_interrupt, PERF_EVENT_IOC_RESET, 0)) {
+      FATAL() << "ioctl(PERF_EVENT_IOC_RESET) failed";
+    }
+    if (ioctl(fd_ticks_interrupt, PERF_EVENT_IOC_PERIOD, &ticks_period)) {
+      FATAL() << "ioctl(PERF_EVENT_IOC_PERIOD) failed with period "
+              << ticks_period;
+    }
+    if (ioctl(fd_ticks_interrupt, PERF_EVENT_IOC_ENABLE, 0)) {
+      FATAL() << "ioctl(PERF_EVENT_IOC_ENABLE) failed";
+    }
+    if (fd_ticks_measure.is_open()) {
+      if (ioctl(fd_ticks_measure, PERF_EVENT_IOC_RESET, 0)) {
+        FATAL() << "ioctl(PERF_EVENT_IOC_RESET) failed";
+      }
+      if (ioctl(fd_ticks_measure, PERF_EVENT_IOC_ENABLE, 0)) {
+        FATAL() << "ioctl(PERF_EVENT_IOC_ENABLE) failed";
+      }
+    }
+    if (fd_ticks_in_transaction.is_open()) {
+      if (ioctl(fd_ticks_in_transaction, PERF_EVENT_IOC_RESET, 0)) {
+        FATAL() << "ioctl(PERF_EVENT_IOC_RESET) failed";
+      }
+      if (ioctl(fd_ticks_in_transaction, PERF_EVENT_IOC_ENABLE, 0)) {
+        FATAL() << "ioctl(PERF_EVENT_IOC_ENABLE) failed";
+      }
+    }
   }
 
   started = true;
+  counting = true;
+}
+
+void PerfCounters::set_tid(pid_t tid) {
+  stop();
+  this->tid = tid;
 }
 
 void PerfCounters::stop() {
@@ -241,21 +554,69 @@ void PerfCounters::stop() {
   }
   started = false;
 
-  fd_ticks.close();
+  fd_ticks_interrupt.close();
+  fd_ticks_measure.close();
   fd_page_faults.close();
   fd_hw_interrupts.close();
   fd_instructions_retired.close();
+  fd_useless_counter.close();
+  fd_ticks_in_transaction.close();
 }
 
-static int64_t read_counter(ScopedFd& fd) {
-  int64_t val;
-  ssize_t nread = read(fd, &val, sizeof(val));
-  assert(nread == sizeof(val));
-  return val;
+void PerfCounters::stop_counting() {
+  counting = false;
+  if (always_recreate_counters()) {
+    stop();
+  } else {
+    ioctl(fd_ticks_interrupt, PERF_EVENT_IOC_DISABLE, 0);
+    if (fd_ticks_measure.is_open()) {
+      ioctl(fd_ticks_measure, PERF_EVENT_IOC_DISABLE, 0);
+    }
+    if (fd_ticks_in_transaction.is_open()) {
+      ioctl(fd_ticks_in_transaction, PERF_EVENT_IOC_DISABLE, 0);
+    }
+  }
 }
 
-Ticks PerfCounters::read_ticks() {
-  return started ? read_counter(fd_ticks) : 0;
+Ticks PerfCounters::read_ticks(Task* t) {
+  if (!started || !counting) {
+    return 0;
+  }
+
+  if (fd_ticks_in_transaction.is_open()) {
+    uint64_t transaction_ticks = read_counter(fd_ticks_in_transaction);
+    if (transaction_ticks > 0) {
+      LOG(debug) << transaction_ticks << " IN_TX ticks detected";
+      if (!Flags::get().force_things) {
+        ASSERT(t, false)
+            << transaction_ticks
+            << " IN_TX ticks detected while HLE not supported due to KVM PMU\n"
+               "virtualization bug. See "
+               "http://marc.info/?l=linux-kernel&m=148582794808419&w=2\n"
+               "Aborting. Retry with -F to override, but it will probably\n"
+               "fail.";
+      }
+    }
+  }
+
+  uint64_t interrupt_val = read_counter(fd_ticks_interrupt);
+  if (!fd_ticks_measure.is_open()) {
+    return interrupt_val;
+  }
+
+  uint64_t measure_val = read_counter(fd_ticks_measure);
+  if (measure_val > interrupt_val) {
+    // There is some kind of kernel or hardware bug that means we sometimes
+    // see more events with IN_TXCP set than without. These are clearly
+    // spurious events :-(. For now, work around it by returning the
+    // interrupt_val. That will work if HLE hasn't been used in this interval.
+    // Note that interrupt_val > measure_val is valid behavior (when HLE is
+    // being used).
+    LOG(debug) << "Measured too many ticks; measure=" << measure_val
+               << ", interrupt=" << interrupt_val;
+    return interrupt_val;
+  }
+  return measure_val;
 }
 
 PerfCounters::Extra PerfCounters::read_extra() {
@@ -271,3 +632,5 @@ PerfCounters::Extra PerfCounters::read_extra() {
   }
   return extra;
 }
+
+} // namespace rr

@@ -3,58 +3,19 @@
 #ifndef RR_KERNEL_ABI_H
 #define RR_KERNEL_ABI_H
 
-// Include remote_ptr.h first since it (indirectly) requires a definition of
-// ERANGE, which other headers below #undef :-(
-#include "remote_ptr.h"
-
-// Get all the kernel definitions so we can verify our alternative versions.
-#include <arpa/inet.h>
-#include <asm/ldt.h>
-#include <elf.h>
-#include <fcntl.h>
-#include <linux/capability.h>
-#include <linux/ethtool.h>
-#include <linux/filter.h>
-#include <linux/futex.h>
-#include <linux/ipc.h>
-#include <linux/msg.h>
-#include <linux/net.h>
-#include <linux/sem.h>
-#include <linux/shm.h>
-#include <linux/sockios.h>
-#include <linux/sysctl.h>
-#include <linux/videodev2.h>
-#include <linux/wireless.h>
-#include <poll.h>
-#include <signal.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <sound/asound.h>
-#include <sys/epoll.h>
-#include <sys/ioctl.h>
-#include <sys/quota.h>
-#include <sys/resource.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/times.h>
-#include <sys/un.h>
-#include <sys/user.h>
-#include <sys/utsname.h>
-#include <sys/vfs.h>
-#include <sys/sysinfo.h>
-#include <termios.h>
-
 #include <assert.h>
+#include <signal.h>
 
 #include <vector>
+
+#include "remote_ptr.h"
+
+namespace rr {
 
 class remote_code_ptr;
 class Task;
 
 enum SupportedArch { x86, x86_64, SupportedArch_MAX = x86_64 };
-
-namespace rr {
 
 #if defined(__i386__)
 const SupportedArch RR_NATIVE_ARCH = SupportedArch::x86;
@@ -80,16 +41,15 @@ template <typename T> struct Verifier<RR_NATIVE_ARCH, T, T> {
   // with itself or (unlikely) the system's structure with itself.
 };
 
-#define RR_VERIFY_TYPE_ARCH(arch_, system_type_, rr_type_)                     \
-  static_assert(Verifier<arch_, system_type_, rr_type_>::same_size,            \
-                "type " #system_type_ " not correctly defined");
-
-// For instances where the system type and the rr type are named differently.
-#define RR_VERIFY_TYPE_EXPLICIT(system_type_, rr_type_)                        \
-  RR_VERIFY_TYPE_ARCH(arch_, system_type_, rr_type_)
-
-// For instances where the system type and the rr type are named identically.
-#define RR_VERIFY_TYPE(type_) RR_VERIFY_TYPE_EXPLICIT(::type_, type_)
+// We want verify that the types have the same size as their
+// counterparts in the system header. To avoid having to include
+// all system headers here, we instead make the verification macros
+// a no-op unless inlcuded from kernel_abi.cc.
+#ifndef RR_VERIFY_TYPE
+#define RR_VERIFY_TYPE_ARCH(arch_, system_type_, rr_type_) // no-op
+#define RR_VERIFY_TYPE_EXPLICIT(system_type_, rr_type_)    // no-op
+#define RR_VERIFY_TYPE(x)                                  // no-op
+#endif
 
 struct KernelConstants {
   static const ::size_t SIGINFO_MAX_SIZE = 128;
@@ -131,15 +91,28 @@ struct FcntlConstants {
     SETLKW64 = 14,
     SETOWN_EX = 15,
     GETOWN_EX = 16,
-    // Linux-specific operations
+    // Open File descriptor locks (Linux specific)
+    OFD_GETLK = 36,
+    OFD_SETLK = 37,
+    OFD_SETLKW = 38,
+    // Other Linux-specific operations
     DUPFD_CLOEXEC = 0x400 + 6,
     ADD_SEALS = 0x400 + 9
   };
 };
 
-struct WordSize32Defs : public KernelConstants {
+// Various ELF constants we use. These are verified to be the same
+// as those in the system headers by kernel_abi.cc
+enum ELFCLASS { CLASSNONE = 0, CLASS32 = 1, CLASS64 = 2 };
+enum ELFENDIAN { DATA2LSB = 1 };
+enum EM {
+  I386 = 3,
+  X86_64 = 62,
+};
+
+struct WordSize32Defs {
   static const ::size_t SIGINFO_PAD_SIZE =
-      (SIGINFO_MAX_SIZE / sizeof(int32_t)) - 3;
+      (KernelConstants::SIGINFO_MAX_SIZE / sizeof(int32_t)) - 3;
 
   typedef int16_t signed_short;
   typedef uint16_t unsigned_short;
@@ -163,15 +136,56 @@ struct WordSize32Defs : public KernelConstants {
   typedef int32_t sigchld_clock_t;
   typedef uint32_t __statfs_word;
 
-  static const size_t elfclass = ELFCLASS32;
-  typedef Elf32_Ehdr ElfEhdr;
-  typedef Elf32_Shdr ElfShdr;
-  typedef Elf32_Sym ElfSym;
+  static const size_t elfclass = ELFCLASS::CLASS32;
+  typedef struct {
+    uint8_t e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint32_t e_entry;
+    uint32_t e_phoff;
+    uint32_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+  } ElfEhdr;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Ehdr, ElfEhdr);
+  typedef struct {
+    uint32_t sh_name;
+    uint32_t sh_type;
+    uint32_t sh_flags;
+    uint32_t sh_addr;
+    uint32_t sh_offset;
+    uint32_t sh_size;
+    uint32_t sh_link;
+    uint32_t sh_info;
+    uint32_t sh_addralign;
+    uint32_t sh_entsize;
+  } ElfShdr;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Shdr, ElfShdr);
+  typedef struct {
+    uint32_t st_name;
+    uint32_t st_value;
+    uint32_t st_size;
+    uint8_t st_info;
+    uint8_t st_other;
+    uint16_t st_shndx;
+  } ElfSym;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Sym, ElfSym);
+  typedef struct {
+    int32_t d_tag;
+    uint32_t d_val;
+  } ElfDyn;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Dyn, ElfDyn);
 };
 
-struct WordSize64Defs : public KernelConstants {
+struct WordSize64Defs {
   static const ::size_t SIGINFO_PAD_SIZE =
-      (SIGINFO_MAX_SIZE / sizeof(int32_t)) - 4;
+      (KernelConstants::SIGINFO_MAX_SIZE / sizeof(int32_t)) - 4;
 
   typedef int16_t signed_short;
   typedef uint16_t unsigned_short;
@@ -195,10 +209,51 @@ struct WordSize64Defs : public KernelConstants {
   typedef int64_t sigchld_clock_t;
   typedef signed_long __statfs_word;
 
-  static const size_t elfclass = ELFCLASS64;
-  typedef Elf64_Ehdr ElfEhdr;
-  typedef Elf64_Shdr ElfShdr;
-  typedef Elf64_Sym ElfSym;
+  static const size_t elfclass = ELFCLASS::CLASS64;
+  typedef struct {
+    uint8_t e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;
+    uint64_t e_phoff;
+    uint64_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+  } ElfEhdr;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Ehdr, ElfEhdr);
+  typedef struct {
+    uint32_t sh_name;
+    uint32_t sh_type;
+    uint64_t sh_flags;
+    uint64_t sh_addr;
+    uint64_t sh_offset;
+    uint64_t sh_size;
+    uint32_t sh_link;
+    uint32_t sh_info;
+    uint64_t sh_addralign;
+    uint64_t sh_entsize;
+  } ElfShdr;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Shdr, ElfShdr);
+  typedef struct {
+    uint32_t st_name;
+    uint8_t st_info;
+    uint8_t st_other;
+    uint16_t st_shndx;
+    uint64_t st_value;
+    uint64_t st_size;
+  } ElfSym;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Sym, ElfSym);
+  typedef struct {
+    uint64_t d_tag;
+    uint64_t d_val;
+  } ElfDyn;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Dyn, ElfDyn);
 };
 
 /**
@@ -207,7 +262,9 @@ struct WordSize64Defs : public KernelConstants {
  * the tracee.
  */
 template <SupportedArch arch_, typename wordsize>
-struct BaseArch : public wordsize, public FcntlConstants {
+struct BaseArch : public wordsize,
+                  public FcntlConstants,
+                  public KernelConstants {
   static SupportedArch arch() { return arch_; }
 
   typedef typename wordsize::syscall_slong_t syscall_slong_t;
@@ -450,6 +507,16 @@ struct BaseArch : public wordsize, public FcntlConstants {
   };
   RR_VERIFY_TYPE(termios);
 
+  struct termio {
+    unsigned_short c_iflag;
+    unsigned_short c_oflag;
+    unsigned_short c_cflag;
+    unsigned_short c_lflag;
+    unsigned char c_line;
+    unsigned char c_cc[8];
+  };
+  RR_VERIFY_TYPE(termio);
+
   struct winsize {
     unsigned_short ws_row;
     unsigned_short ws_col;
@@ -476,7 +543,7 @@ struct BaseArch : public wordsize, public FcntlConstants {
   struct msqid64_ds {
     ipc64_perm msg_perm;
     // These msg*time fields are really __kernel_time_t plus
-    // appropiate padding.  We don't touch the fields, though.
+    // appropriate padding.  We don't touch the fields, though.
     //
     // We do, however, suffix them with _only_little_endian to
     // urge anybody who does touch them to make sure the right
@@ -506,7 +573,8 @@ struct BaseArch : public wordsize, public FcntlConstants {
   };
   RR_VERIFY_TYPE(msginfo);
 
-  struct shmid64_ds {
+  /* Don't align for the 64-bit values on 32-bit x86 */
+  struct __attribute__((packed)) shmid64_ds {
     ipc64_perm shm_perm;
     size_t shm_segsz;
     uint64_t shm_atime_only_little_endian;
@@ -781,7 +849,7 @@ struct BaseArch : public wordsize, public FcntlConstants {
   };
   RR_VERIFY_TYPE(ethtool_cmd);
 
-  struct flock {
+  struct _flock {
     signed_short l_type;
     signed_short l_whence;
     char __pad[sizeof(off_t) - 2 * sizeof(short)];
@@ -789,7 +857,7 @@ struct BaseArch : public wordsize, public FcntlConstants {
     off_t l_len;
     pid_t l_pid;
   };
-  RR_VERIFY_TYPE(flock);
+  RR_VERIFY_TYPE_EXPLICIT(struct ::flock, _flock);
 
   struct flock64 {
     signed_short l_type;
@@ -818,7 +886,11 @@ struct BaseArch : public wordsize, public FcntlConstants {
     ptr<socklen_t> addrlen;
   };
 
-  struct accept4_args : public accept_args {
+  struct accept4_args {
+    signed_int sockfd;
+    char __pad[sizeof(ptr<void>) - sizeof(int)];
+    ptr<sockaddr> addr;
+    ptr<socklen_t> addrlen;
     signed_long flags;
   };
 
@@ -836,6 +908,14 @@ struct BaseArch : public wordsize, public FcntlConstants {
     char __pad[sizeof(ptr<void>) - sizeof(int)];
     ptr<void> optval;
     ptr<socklen_t> optlen;
+  };
+
+  struct setsockopt_args {
+    signed_long sockfd;
+    signed_long level;
+    signed_long optname;
+    ptr<void> optval;
+    signed_long optlen;
   };
 
   struct recv_args {
@@ -962,23 +1042,28 @@ struct BaseArch : public wordsize, public FcntlConstants {
   RR_VERIFY_TYPE(__sysctl_args);
 
   typedef struct {
+    unsigned_long __val[64 / (8 * sizeof(unsigned_long))];
+  } kernel_sigset_t;
+
+  // libc reserves some space in the user facing structures for future
+  // extensibility.
+  typedef struct {
     unsigned_long __val[1024 / (8 * sizeof(unsigned_long))];
   } __sigset_t;
   typedef __sigset_t sigset_t;
   RR_VERIFY_TYPE(sigset_t);
 
+  typedef struct {
+    ptr<const kernel_sigset_t> ss;
+    size_t ss_len;
+  } pselect6_arg6;
+
   struct kernel_sigaction {
     ptr<void> k_sa_handler;
     unsigned_long sa_flags;
     ptr<void> sa_restorer;
-    sigset_t sa_mask;
+    kernel_sigset_t sa_mask;
   };
-
-  // The 'size' parameter to pass to rt_sigaction. Only this value works,
-  // even though sizeof(sigset_t) > 8 (it's actually 128 with kernel 3.16,
-  // as above).
-  enum { sigaction_sigset_size = 8 };
-
   struct tms {
     clock_t tms_utime;
     clock_t tms_stime;
@@ -1180,11 +1265,206 @@ struct BaseArch : public wordsize, public FcntlConstants {
     unsigned char components[128];
   };
   RR_VERIFY_TYPE(snd_ctl_card_info);
+
+  struct usbdevfs_iso_packet_desc {
+    unsigned int length;
+    unsigned int actual_length;
+    unsigned int status;
+  };
+  RR_VERIFY_TYPE(usbdevfs_iso_packet_desc);
+
+  struct usbdevfs_urb {
+    unsigned char type;
+    unsigned char endpoint;
+    int status;
+    unsigned int flags;
+    ptr<void> buffer;
+    int buffer_length;
+    int actual_length;
+    int start_frame;
+    union {
+      int number_of_packets;
+      unsigned int stream_id;
+    };
+    int error_count;
+    unsigned int signr;
+    ptr<void> usercontext;
+    struct usbdevfs_iso_packet_desc iso_frame_desc[0];
+  };
+  RR_VERIFY_TYPE(usbdevfs_urb);
+
+  struct usbdevfs_ioctl {
+    int ifno;
+    int ioctl_code;
+    ptr<void> data;
+  };
+  RR_VERIFY_TYPE(usbdevfs_ioctl);
+
+  struct usbdevfs_ctrltransfer {
+    uint8_t bRequestType;
+    uint8_t bRequest;
+    uint16_t wValue;
+    uint16_t wIndex;
+    uint16_t wLength;
+    uint32_t timeout;
+    ptr<void> data;
+  };
+  RR_VERIFY_TYPE(usbdevfs_ctrltransfer);
+
+  struct dirent {
+    ino_t d_ino;
+    off_t d_off;
+    uint16_t d_reclen;
+    //    uint8_t d_type;
+    uint8_t d_name[256];
+  };
+  RR_VERIFY_TYPE(dirent);
+
+  struct dirent64 {
+    ino64_t d_ino;
+    off64_t d_off;
+    uint16_t d_reclen;
+    uint8_t d_type;
+    uint8_t d_name[256];
+  };
+  RR_VERIFY_TYPE(dirent64);
+
+  struct mq_attr {
+    signed_long mq_flags;
+    signed_long mq_maxmsg;
+    signed_long mq_msgsize;
+    signed_long mq_curmsgs;
+    signed_long __reserved[4];
+  };
+  RR_VERIFY_TYPE(mq_attr);
+
+  struct xt_counters {
+    uint64_t pcnt, bcnt;
+  };
+  RR_VERIFY_TYPE(xt_counters);
+
+  struct ipt_replace {
+    uint8_t name[32];
+    uint32_t valid_hook;
+    uint32_t num_entries;
+    uint32_t size;
+    uint32_t hook_entry[5];
+    uint32_t underflow[5];
+    uint32_t num_counters;
+    ptr<xt_counters> counters; // ptr<xt_counters>
+    // Plus hangoff here
+  };
+  // The corresponding header requires -fpermissive, which we don't pass. Skip
+  // this check.
+  // RR_VERIFY_TYPE(ipt_replace);
+
+  struct cap_header {
+    uint32_t version;
+    int pid;
+  };
+
+  struct cap_data {
+    uint32_t effective;
+    uint32_t permitted;
+    uint32_t inheritable;
+  };
+
+  struct hci_dev_req {
+    uint16_t dev_id;
+    uint32_t dev_opt;
+  };
+
+  struct hci_dev_list_req {
+    uint16_t dev_num;
+    struct hci_dev_req dev_req[0];
+  };
+
+  typedef struct { uint8_t b[6]; } __attribute__((__packed__)) bdaddr_t;
+
+  struct hci_dev_stats {
+    uint32_t err_rx;
+    uint32_t err_tx;
+    uint32_t cmd_tx;
+    uint32_t evt_rx;
+    uint32_t acl_tx;
+    uint32_t acl_rx;
+    uint32_t sco_tx;
+    uint32_t sco_rx;
+    uint32_t byte_rx;
+    uint32_t byte_tx;
+  };
+
+  struct hci_dev_info {
+    uint16_t dev_id;
+    char name[8];
+
+    bdaddr_t bdaddr;
+
+    uint32_t flags;
+    uint8_t type;
+
+    uint8_t features[8];
+
+    uint32_t pkt_type;
+    uint32_t link_policy;
+    uint32_t link_mode;
+
+    uint16_t acl_mtu;
+    uint16_t acl_pkts;
+    uint16_t sco_mtu;
+    uint16_t sco_pkts;
+
+    struct hci_dev_stats stat;
+  };
+
+  typedef struct ifbond {
+    int32_t bond_mode;
+    int32_t num_slaves;
+    int32_t miimon;
+  } ifbond;
+  RR_VERIFY_TYPE(ifbond);
+
+  typedef struct timex {
+    unsigned int modes;
+    __kernel_long_t offset;
+    __kernel_long_t freq;
+    __kernel_long_t maxerror;
+    __kernel_long_t esterror;
+    int status;
+    __kernel_long_t constant;
+    __kernel_long_t precision;
+    __kernel_long_t tolerance;
+    timeval time;
+    __kernel_long_t tick;
+    __kernel_long_t ppsfreq;
+    __kernel_long_t jitter;
+    int shift;
+    __kernel_long_t stabil;
+    __kernel_long_t jitcnt;
+    __kernel_long_t calcnt;
+    __kernel_long_t errcnt;
+    __kernel_long_t stbcnt;
+    int tai;
+
+    // Further padding bytes to allow for future expansion.
+    int : 32;
+    int : 32;
+    int : 32;
+    int : 32;
+    int : 32;
+    int : 32;
+    int : 32;
+    int : 32;
+    int : 32;
+    int : 32;
+    int : 32;
+  } timex;
+  RR_VERIFY_TYPE(timex);
 };
 
 struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
-  static const size_t elfmachine = EM_386;
-  static const size_t elfendian = ELFDATA2LSB;
+  static const size_t elfmachine = EM::I386;
+  static const size_t elfendian = ELFENDIAN::DATA2LSB;
 
   static const MmapCallingSemantics mmap_semantics = StructArguments;
   static const CloneTLSType clone_tls_type = UserDescPointer;
@@ -1259,6 +1539,68 @@ struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
                       user_fpxregs_struct);
 #endif
 
+  struct sigcontext {
+    uint16_t gs, __gsh;
+    uint16_t fs, __fsh;
+    uint16_t es, __esh;
+    uint16_t ds, __dsh;
+    uint32_t di;
+    uint32_t si;
+    uint32_t bp;
+    uint32_t sp;
+    uint32_t bx;
+    uint32_t dx;
+    uint32_t cx;
+    uint32_t ax;
+    uint32_t trapno;
+    uint32_t err;
+    uint32_t ip;
+    uint16_t cs, __csh;
+    uint32_t flags;
+    uint32_t sp_at_signal;
+    uint16_t ss, __ssh;
+    uint32_t fpstate;
+    uint32_t oldmask;
+    uint32_t cr2;
+  };
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, ::sigcontext, sigcontext);
+
+  struct ucontext {
+    uint32_t uc_flags;
+    uint32_t uc_link;
+    stack_t uc_stack;
+    sigcontext uc_mcontext;
+    kernel_sigset_t uc_sigmask;
+  };
+
+  struct rt_sigframe {
+    uint32_t pretcode;
+    int sig;
+    uint32_t pinfo;
+    uint32_t puc;
+    siginfo_t info;
+    struct ucontext uc;
+  };
+
+  struct _fpstate_32 {
+    uint32_t cw, sw, tag, ipoff, cssel, dataoff, datasel;
+    uint16_t _st[40];
+    uint16_t status, magic;
+    uint32_t _fxsr_env[6], mxcsr, reserved;
+    uint32_t _fxsr_st[32];
+    uint32_t _xmm[32];
+    uint32_t padding[56];
+  };
+
+  struct sigframe {
+    uint32_t pretcode;
+    int sig;
+    sigcontext sc;
+    _fpstate_32 unused;
+    uint32_t extramask;
+    char retcode[8];
+  };
+
   struct user {
     user_regs_struct regs;
     int u_fpvalid;
@@ -1299,7 +1641,7 @@ struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86, struct ::stat, struct stat);
 
-  struct stat64 {
+  struct __attribute__((packed)) stat64 {
     dev_t st_dev;
     unsigned_int __pad1;
     ino_t __st_ino;
@@ -1321,8 +1663,8 @@ struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
 };
 
 struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
-  static const size_t elfmachine = EM_X86_64;
-  static const size_t elfendian = ELFDATA2LSB;
+  static const size_t elfmachine = EM::X86_64;
+  static const size_t elfendian = ELFENDIAN::DATA2LSB;
 
   static const MmapCallingSemantics mmap_semantics = RegisterArguments;
   static const CloneTLSType clone_tls_type = PthreadStructurePointer;
@@ -1385,6 +1727,38 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::user_regs_struct,
                       user_regs_struct);
 
+  struct sigcontext {
+    uint64_t r8;
+    uint64_t r9;
+    uint64_t r10;
+    uint64_t r11;
+    uint64_t r12;
+    uint64_t r13;
+    uint64_t r14;
+    uint64_t r15;
+    uint64_t di;
+    uint64_t si;
+    uint64_t bp;
+    uint64_t bx;
+    uint64_t dx;
+    uint64_t ax;
+    uint64_t cx;
+    uint64_t sp;
+    uint64_t ip;
+    uint64_t flags;
+    uint16_t cs;
+    uint16_t gs;
+    uint16_t fs;
+    uint16_t __pad0;
+    uint64_t err;
+    uint64_t trapno;
+    uint64_t oldmask;
+    uint64_t cr2;
+    uint64_t fpstate;
+    uint64_t reserved[8];
+  };
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::sigcontext, sigcontext);
+
   struct user_fpregs_struct {
     uint16_t cwd;
     uint16_t swd;
@@ -1400,6 +1774,22 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::user_fpregs_struct,
                       user_fpregs_struct);
+
+  struct ucontext {
+    uint64_t ucflags;
+    ptr<struct ucontext> uc_link;
+    stack_t uc_stack;
+    struct sigcontext uc_mcontext;
+    sigset_t uc_sigmask;
+    user_fpregs_struct uc_fpregs;
+  };
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::ucontext, ucontext);
+
+  struct rt_sigframe {
+    ptr<char> pretcode;
+    struct ucontext uc;
+    siginfo_t info;
+  };
 
   struct user {
     struct user_regs_struct regs;
@@ -1478,6 +1868,13 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
 #include "SyscallHelperFunctions.generated"
 
 /**
+ * Return true if |ptr| in task |t| points to an invoke-syscall instruction,
+ * and if so, return the architecture for which this is a syscall in *arch.
+ */
+bool get_syscall_instruction_arch(Task* t, remote_code_ptr ptr,
+                                  SupportedArch* arch);
+
+/**
  * Return true if |ptr| in task |t| points to an invoke-syscall instruction.
  */
 bool is_at_syscall_instruction(Task* t, remote_code_ptr ptr);
@@ -1494,6 +1891,9 @@ std::vector<uint8_t> syscall_instruction(SupportedArch arch);
  */
 ssize_t syscall_instruction_length(SupportedArch arch);
 
+void set_arch_siginfo(const siginfo_t& siginfo, SupportedArch a, void* dest,
+                      size_t dest_size);
+
 #if defined(__i386__)
 typedef X86Arch NativeArch;
 #elif defined(__x86_64__)
@@ -1503,5 +1903,10 @@ typedef X64Arch NativeArch;
 #endif
 
 } // namespace rr
+
+// New in the 4.6 kernel.
+#ifndef CLONE_NEWCGROUP
+#define CLONE_NEWCGROUP 0x02000000
+#endif
 
 #endif /* RR_KERNEL_ABI_H */

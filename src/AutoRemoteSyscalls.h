@@ -9,7 +9,9 @@
 
 #include "Registers.h"
 #include "ScopedFd.h"
-#include "task.h"
+#include "Task.h"
+
+namespace rr {
 
 class AutoRemoteSyscalls;
 class Task;
@@ -38,8 +40,7 @@ public:
    * available via |get|.
    * If |mem| is null, data is not written, only the space is reserved.
    */
-  AutoRestoreMem(AutoRemoteSyscalls& remote, const uint8_t* mem,
-                 ssize_t num_bytes)
+  AutoRestoreMem(AutoRemoteSyscalls& remote, const void* mem, ssize_t num_bytes)
       : remote(remote) {
     init(mem, num_bytes);
   }
@@ -65,7 +66,7 @@ public:
   size_t size() const { return data.size(); }
 
 private:
-  void init(const uint8_t* mem, ssize_t num_bytes);
+  void init(const void* mem, ssize_t num_bytes);
 
   AutoRemoteSyscalls& remote;
   /* Address of tmp mem. */
@@ -85,7 +86,9 @@ private:
 
 /**
  * RAII helper to prepare a Task for remote syscalls and undo any
- * preparation upon going out of scope.
+ * preparation upon going out of scope. Note that this restores register
+ * values when going out of scope, so *all* changes to Task's register
+ * state are lost.
  */
 class AutoRemoteSyscalls {
 public:
@@ -173,12 +176,14 @@ public:
                                            int prot, int flags, int child_fd,
                                            uint64_t offset_pages);
 
+  int64_t infallible_lseek_syscall(int fd, int64_t offset, int whence);
+
   /** The Task in the context of which we're making syscalls. */
   Task* task() const { return t; }
 
   /**
    * A small helper to get at the Task's arch.
-   * Out-of-line to avoid including task.h here.
+   * Out-of-line to avoid including Task.h here.
    */
   SupportedArch arch() const;
 
@@ -201,6 +206,8 @@ public:
    */
   enum SyscallWaiting { WAIT = 1, DONT_WAIT = 0 };
   void syscall_helper(SyscallWaiting wait, int syscallno, Registers& callregs);
+
+  MemParamsEnabled enable_mem_params() { return enable_mem_params_; }
 
 private:
   /**
@@ -235,14 +242,24 @@ private:
 
   Task* t;
   Registers initial_regs;
+  WaitStatus initial_wait_status;
   remote_code_ptr initial_ip;
   remote_ptr<void> initial_sp;
+  remote_ptr<void> fixed_sp;
   int pending_syscallno;
+  std::vector<uint8_t> replaced_bytes;
+
+  /* Whether we had to mmap a scratch region because none was found */
+  bool scratch_mem_was_mapped;
+
+  MemParamsEnabled enable_mem_params_;
 
   AutoRemoteSyscalls& operator=(const AutoRemoteSyscalls&) = delete;
   AutoRemoteSyscalls(const AutoRemoteSyscalls&) = delete;
   void* operator new(size_t) = delete;
   void operator delete(void*) = delete;
 };
+
+} // namespace rr
 
 #endif // RR_AUTO_REMOTE_SYSCALLS_H_

@@ -11,6 +11,8 @@
 #include "GdbRegister.h"
 #include "kernel_abi.h"
 
+namespace rr {
+
 /**
  * An ExtraRegisters object contains values for all user-space-visible
  * registers other than those in Registers.
@@ -49,17 +51,25 @@ public:
   enum Format { NONE, XSAVE };
 
   // Set values from raw data
-  void set_to_raw_data(Format format, std::vector<uint8_t>& consume_data) {
+  void set_to_raw_data(SupportedArch a, Format format,
+                       std::vector<uint8_t>& consume_data) {
+    arch_ = a;
     format_ = format;
-    std::swap(data, consume_data);
+    std::swap(data_, consume_data);
+
+    // The actual XSAVE minimum size is 576 bytes (512 followed by a 64-byte
+    // XSAVE header) but sometimes we're storing an FXSAVE(64) which is only
+    // 512 bytes.
+    static const size_t min_xsave_size = 512;
+    assert(format == NONE || data_.size() >= min_xsave_size);
   }
-  void set_arch(SupportedArch a) { arch_ = a; }
 
   Format format() const { return format_; }
   SupportedArch arch() const { return arch_; }
-  int data_size() const { return data.size(); }
-  const uint8_t* data_bytes() const { return data.data(); }
-  bool empty() const { return data.empty(); }
+  const std::vector<uint8_t> data() const { return data_; }
+  int data_size() const { return data_.size(); }
+  const uint8_t* data_bytes() const { return data_.data(); }
+  bool empty() const { return data_.empty(); }
 
   /**
    * Like |Registers::read_register()|, except attempts to read
@@ -73,16 +83,37 @@ public:
   std::vector<uint8_t> get_user_fpregs_struct(SupportedArch arch) const;
 
   /**
+   * Update registers from a user_fpregs_struct.
+   */
+  void set_user_fpregs_struct(SupportedArch arch, void* data, size_t size);
+
+  /**
    * Get a user_fpxregs_struct for from these ExtraRegisters.
    */
-  rr::X86Arch::user_fpxregs_struct get_user_fpxregs_struct() const;
+  X86Arch::user_fpxregs_struct get_user_fpxregs_struct() const;
+
+  /**
+   * Update registers from a user_fpxregs_struct.
+   */
+  void set_user_fpxregs_struct(const X86Arch::user_fpxregs_struct& regs);
+
+  void print_register_file_compact(FILE* f) const;
+
+  /**
+   * Reset to post-exec initial state
+   */
+  void reset();
+
+  void validate(Task* t);
 
 private:
   friend class Task;
 
   Format format_;
   SupportedArch arch_;
-  std::vector<uint8_t> data;
+  std::vector<uint8_t> data_;
 };
+
+} // namespace rr
 
 #endif /* RR_EXTRA_REGISTERS_H_ */

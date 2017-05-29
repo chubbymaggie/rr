@@ -5,7 +5,9 @@
 
 #include <vector>
 
-#include "task.h"
+#include "Task.h"
+
+namespace rr {
 
 class Registers;
 
@@ -41,5 +43,10 @@ bool fast_forward_through_instruction(
  * reasons, this should be rare).
  */
 bool maybe_at_or_after_x86_string_instruction(Task* t);
+
+/* Return true if the instruction at t->ip() is a string instruction */
+bool at_x86_string_instruction(Task* t);
+
+} // namespace rr
 
 #endif // RR_FAST_FORWARD_H_

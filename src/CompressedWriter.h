@@ -7,10 +7,12 @@
 #include <stdint.h>
 
 #include <memory>
-#include <vector>
 #include <string>
+#include <vector>
 
 #include "ScopedFd.h"
+
+namespace rr {
 
 /**
  * CompressedWriter opens an output file and writes compressed blocks to it.
@@ -101,5 +103,7 @@ protected:
   uint64_t producer_reserved_upto_pos;
   bool error;
 };
+
+} // namespace rr
 
 #endif /* RR_COMPRESSED_WRITER_H_ */

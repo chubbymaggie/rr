@@ -14,6 +14,12 @@
 #include "ScopedFd.h"
 #include "Ticks.h"
 
+struct perf_event_attr;
+
+namespace rr {
+
+class Task;
+
 /**
  * A class encapsulating the performance counters we use to monitor
  * each task during recording and replay.
@@ -34,6 +40,8 @@ public:
   PerfCounters(pid_t tid);
   ~PerfCounters() { stop(); }
 
+  void set_tid(pid_t tid);
+
   // Change this to 'true' to enable perf counters that may be interesting
   // for experimentation, but aren't necessary for core functionality.
   static bool extra_perf_counters_enabled() { return false; }
@@ -41,9 +49,11 @@ public:
   /**
    * Reset all counter values to 0 and program the counters to send
    * TIME_SLICE_SIGNAL when 'ticks_period' tick events have elapsed. (In reality
-   * the hardware triggers its interrupt some time after that.)
+   * the hardware triggers its interrupt some time after that. We also allow
+   * the interrupt to fire early.)
    * This must be called while the task is stopped, and it must be called
    * before the task is allowed to run again.
+   * `ticks_period` of zero means don't interrupt at all.
    */
   void reset(Ticks ticks_period);
 
@@ -54,14 +64,22 @@ public:
   void stop();
 
   /**
-   * Read the current value of the ticks counter.
+   * Suspend counting until the next reset. This may or may not actually stop
+   * the performance counters, depending on whether or not this is required
+   * for correctness on this kernel version.
    */
-  Ticks read_ticks();
+  void stop_counting();
 
   /**
-   * Return the fd we last used to monitor the ticks counter.
+   * Read the current value of the ticks counter.
+   * `t` is used for debugging purposes.
    */
-  int ticks_fd() const { return fd_ticks.get(); }
+  Ticks read_ticks(Task* t);
+
+  /**
+   * Return the fd we last used to generate the ticks-counter signal.
+   */
+  int ticks_interrupt_fd() const { return fd_ticks_interrupt.get(); }
 
   /* This choice is fairly arbitrary; linux doesn't use SIGSTKFLT so we
    * hope that tracees don't either. */
@@ -76,13 +94,31 @@ public:
   };
   Extra read_extra();
 
+  static bool is_ticks_attr(const perf_event_attr& attr);
+
+  /* When an interrupt is requested, at most this many ticks may elapse before
+   * the interrupt is delivered.
+   */
+  static uint32_t skid_size();
+
+  bool counting;
+
 private:
   pid_t tid;
-  ScopedFd fd_ticks;
+  // We use separate fds for counting ticks and for generating interrupts. The
+  // former ignores ticks in aborted transactions, and does not support
+  // sample_period; the latter does not ignore ticks in aborted transactions,
+  // but does support sample_period.
+  ScopedFd fd_ticks_measure;
+  ScopedFd fd_ticks_interrupt;
+  ScopedFd fd_ticks_in_transaction;
   ScopedFd fd_page_faults;
   ScopedFd fd_hw_interrupts;
   ScopedFd fd_instructions_retired;
+  ScopedFd fd_useless_counter;
   bool started;
 };
+
+} // namespace rr
 
 #endif /* RR_PERF_COUNTERS_H_ */

@@ -6,6 +6,8 @@
 #include "EmuFs.h"
 #include "Session.h"
 
+namespace rr {
+
 class ReplaySession;
 
 /**
@@ -49,14 +51,16 @@ public:
   DiversionResult diversion_step(Task* t, RunCommand command = RUN_CONTINUE,
                                  int signal_to_deliver = 0);
 
-  virtual DiversionSession* as_diversion() { return this; }
+  virtual DiversionSession* as_diversion() override { return this; }
 
 private:
   friend class ReplaySession;
 
-  DiversionSession(const ReplaySession& other);
+  DiversionSession();
 
   std::shared_ptr<EmuFs> emu_fs;
 };
+
+} // namespace rr
 
 #endif // RR_DIVERSION_SESSION_H_

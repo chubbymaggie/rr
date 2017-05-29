@@ -1,7 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "CompressedWriter"
-
 #define _LARGEFILE64_SOURCE
 
 #include "CompressedWriter.h"
@@ -10,12 +8,14 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <string.h>
-#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <zlib.h>
 
 using namespace std;
+
+namespace rr {
 
 void* CompressedWriter::compression_thread_callback(void* p) {
   static_cast<CompressedWriter*>(p)->compression_thread();
@@ -259,3 +259,5 @@ size_t CompressedWriter::do_compress(uint64_t offset, size_t length,
 
   return stream.total_out;
 }
+
+} // namespace rr
